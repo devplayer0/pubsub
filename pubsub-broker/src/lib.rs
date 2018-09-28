@@ -18,6 +18,8 @@ extern crate ctrlc;
 extern crate num_cpus;
 extern crate crossbeam;
 
+extern crate pubsub_common as common;
+
 use crossbeam::channel::{self, Sender};
 use crossbeam::queue::MsQueue;
 
@@ -186,8 +188,8 @@ impl Broker {
     where I: IntoIterator<Item = SocketAddr>
     {
         let buffers = Arc::new(MsQueue::new());
-        for _ in 0..16 {
-            buffers.push(vec![0; 65536]);
+        for _ in 0..1024 {
+            buffers.push(vec![0; common::IPV6_MAX_PACKET_SIZE]);
         }
 
         let clients = Arc::new(Mutex::new(ClientManager::new(Arc::clone(&buffers))));
@@ -211,10 +213,17 @@ impl Broker {
                         Ok((size, src)) => (size, src),
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                             buffers.push(buffer);
-                            continue
+                            continue;
                         },
                         Err(e) => return Err(Error::Io(e))
                     };
+                    if size > match addr {
+                        SocketAddr::V4(_) => common::IPV4_MAX_PACKET_SIZE,
+                        SocketAddr::V6(_) => common::IPV6_MAX_PACKET_SIZE
+                    } {
+                        buffers.push(buffer);
+                        continue;
+                    }
 
                     clients.lock().unwrap().dispatch(src, Data::from_buffer(buffer, size));
                 }

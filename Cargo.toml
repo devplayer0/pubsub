@@ -1,5 +1,6 @@
 [workspace]
 members = [
+	"pubsub-common",
 	"pubsub-broker",
 	"pubsub-client",
 ]
