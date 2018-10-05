@@ -11,7 +11,7 @@ use simplelog::{LevelFilter, TermLogger};
 use pubsub_broker::config::Config;
 
 fn main() {
-    TermLogger::init(LevelFilter::Trace, simplelog::Config::default()).expect("failed to initialize logger");
+    TermLogger::init(LevelFilter::Debug, simplelog::Config::default()).expect("failed to initialize logger");
 
     if let Err(e) = pubsub_broker::run(Config::default()) {
         error!("{}", e);
