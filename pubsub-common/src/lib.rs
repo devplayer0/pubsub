@@ -156,7 +156,7 @@ impl<'a> TryFrom<&'a Data> for Packet {
             return Err(InvalidHeader);
         }
         let header = buffer[0];
-        let t = (header & (0xff << SEQ_BITS)) >> SEQ_BITS;
+        let t = header >> SEQ_BITS;
         if let Some(t) = PacketType::from_u8(t) {
             let seq = header & (0xff >> (8-SEQ_BITS));
             return match t {
