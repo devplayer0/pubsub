@@ -1,13 +1,16 @@
 #![feature(euclidean_division)]
-#![feature(try_from)]
 
 use std::ops::Deref;
-use std::convert::TryFrom;
+use std::cmp;
 use std::fmt::{self, Display};
-use std::io::{Write, Cursor};
+use std::collections::LinkedList;
+use std::io::{self, Write, Cursor};
+use std::net::{SocketAddr, UdpSocket};
 
 #[macro_use]
 extern crate quick_error;
+#[macro_use]
+extern crate log;
 #[macro_use]
 extern crate enum_primitive;
 extern crate byteorder;
@@ -16,12 +19,14 @@ use enum_primitive::FromPrimitive;
 
 pub const IPV4_MAX_PACKET_SIZE: usize = 508;
 pub const IPV6_MAX_PACKET_SIZE: usize = 1212;
+
 pub const SEQ_BITS: u8 = 3;
 pub const SEQ_RANGE: u8 = 8;
 pub const WINDOW_SIZE: u8 = SEQ_RANGE - 1;
 
 pub const CONNECT_MAGIC: &'static [u8] = b"JQTT";
 pub const HEARTBEAT_MAGIC: u8 = 5;
+pub const MAX_TOPIC_LENGTH: usize = IPV4_MAX_PACKET_SIZE - 1;
 
 #[inline]
 pub fn window_end(window_start: u8) -> u8 {
@@ -116,12 +121,14 @@ impl Display for PacketType {
         })
     }
 }
+
 #[derive(Debug)]
 pub enum Packet {
     Connect,
     Heartbeat,
     Ack(u8),
     Disconnect,
+    Subscribe(String),
 }
 impl Packet {
     pub fn validate_connect(buffer: &Data) -> Result<Packet, DecodeError> {
@@ -146,9 +153,44 @@ impl Packet {
         Data::from_buffer(buffer, 1)
     }
 }
-impl<'a> TryFrom<&'a Data> for Packet {
-    type Error = DecodeError;
-    fn try_from(buffer: &'a Data) -> Result<Self, Self::Error> {
+
+#[derive(Debug)]
+pub struct GoBackN {
+    socket: UdpSocket,
+
+    send_buffer: LinkedList<Data>,
+    send_buffer_sseq: u8,
+    send_seq: u8,
+
+    recv_seq: u8,
+}
+impl GoBackN {
+    pub fn new(socket: UdpSocket) -> GoBackN {
+        GoBackN {
+            socket,
+
+            send_buffer: LinkedList::new(),
+            send_buffer_sseq: 0,
+            send_seq: 0,
+
+            recv_seq: 0,
+        }
+    }
+
+    pub fn handle_ack(&mut self, src: SocketAddr, seq: u8) -> LinkedList<Data> {
+        if !seq_in_window(self.send_buffer_sseq, seq) {
+            warn!("received ack from {} outside of window", src);
+            return LinkedList::new();
+        }
+
+        let buffer_size = self.send_buffer.len();
+        let acknowledged = self.send_buffer.split_off(cmp::min(slide_amount(self.send_buffer_sseq, seq) as usize, buffer_size));
+
+        self.send_buffer_sseq = next_seq(seq);
+        self.send_seq = self.send_buffer_sseq;
+        acknowledged
+    }
+    pub fn decode(&self, buffer: &Data) -> Result<Packet, DecodeError> {
         use DecodeError::*;
         use PacketType::*;
 
@@ -178,6 +220,17 @@ impl<'a> TryFrom<&'a Data> for Packet {
         } else {
             Err(InvalidType(t))
         }
+    }
+
+    pub fn send_heartbeat(&self, addr: SocketAddr, buffer: Vec<u8>) -> Result<Vec<u8>, io::Error> {
+        let heartbeat = Packet::make_heartbeat(buffer);
+        self.socket.send_to(&heartbeat, addr)?;
+        Ok(heartbeat.take())
+    }
+    pub fn send_disconnect(&self, addr: SocketAddr, buffer: Vec<u8>) -> Result<Vec<u8>, io::Error> {
+        let disconnect = Packet::make_disconnect(buffer);
+        self.socket.send_to(&disconnect, addr)?;
+        Ok(disconnect.take())
     }
 }
 

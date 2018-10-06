@@ -1,12 +1,8 @@
-#![feature(try_from)]
-
 use std::error::Error as StdError;
 use std::any::Any;
-use std::convert::TryFrom;
-use std::cmp;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
-use std::collections::{HashMap, LinkedList};
+use std::collections::HashMap;
 use std::thread::{self, ThreadId, JoinHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Condvar};
@@ -26,7 +22,7 @@ extern crate pubsub_common as common;
 use crossbeam::channel::{self, Sender, Receiver};
 use crossbeam::queue::MsQueue;
 
-use common::{Data, Packet};
+use common::{Data, Packet, GoBackN};
 
 pub mod config;
 
@@ -63,15 +59,10 @@ enum WorkerMessage {
 #[derive(Debug)]
 struct Client {
     addr: SocketAddr,
-    socket: UdpSocket,
     buffers: Arc<MsQueue<Vec<u8>>>,
+    gbn: GoBackN,
 
     pub connected: bool,
-    send_buffer: LinkedList<Data>,
-    send_buffer_sseq: u8,
-    send_seq: u8,
-
-    recv_next: u8,
 }
 impl Hash for Client {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -87,49 +78,34 @@ impl Client {
     pub fn new(addr: SocketAddr, socket: UdpSocket, buffers: Arc<MsQueue<Vec<u8>>>) -> Client {
         Client {
             addr,
-            socket,
             buffers,
+            gbn: GoBackN::new(socket),
 
             connected: false,
-            send_buffer: LinkedList::new(),
-            send_buffer_sseq: 0,
-            send_seq: 0,
-
-            recv_next: 0,
         }
     }
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+    pub fn gbn(&mut self) -> &mut GoBackN {
+        &mut self.gbn
+    }
 
     pub fn send_heartbeat(&self) -> Result<(), Error> {
-        let heartbeat = Packet::make_heartbeat(self.buffers.pop());
-        self.socket.send_to(&heartbeat, self.addr)?;
-        self.buffers.push(heartbeat.take());
+        self.buffers.push(self.gbn.send_heartbeat(self.addr, self.buffers.pop())?);
         Ok(())
     }
     pub fn send_disconnect(&self) -> Result<(), Error> {
-        let disconnect = Packet::make_disconnect(self.buffers.pop());
-        self.socket.send_to(&disconnect, self.addr)?;
-        self.buffers.push(disconnect.take());
+        self.buffers.push(self.gbn.send_disconnect(self.addr, self.buffers.pop())?);
         Ok(())
-    }
-    pub fn handle_ack(&mut self, seq: u8) {
-        if !common::seq_in_window(self.send_buffer_sseq, seq) {
-            warn!("received ack from {} outside of window", self.addr);
-            return;
-        }
-
-        let buffer_size = self.send_buffer.len();
-        for buffered in self.send_buffer.split_off(cmp::min(common::slide_amount(self.send_buffer_sseq, seq) as usize, buffer_size)) {
-            self.buffers.push(buffered.take());
-        }
-        self.send_buffer_sseq = common::next_seq(seq);
-        self.send_seq = self.send_buffer_sseq;
     }
     pub fn handle(&mut self, packet: Packet) -> Result<(), Error> {
         match packet {
-            Packet::Ack(seq) => self.handle_ack(seq),
+            Packet::Ack(seq) => {
+                for buffer in self.gbn.handle_ack(self.addr, seq) {
+                    self.buffers.push(buffer.take());
+                }
+            },
             Packet::Heartbeat => {
                 // TODO: timeout
                 debug!("got heartbeat from {}", self.addr);
@@ -188,13 +164,14 @@ impl Worker {
                             }
 
                             let result = {
-                                let result = Packet::try_from(&data);
+                                let mut client = r_clients[&src].lock().unwrap();
+                                let result = client.gbn().decode(&data);
                                 if let Ok(packet) = result {
                                     match packet {
                                         Packet::Disconnect => {
                                             Ok(true)
                                         },
-                                        _ => r_clients[&src].lock().unwrap().handle(packet).map(|_| false),
+                                        _ => client.handle(packet).map(|_| false),
                                     }
                                 } else {
                                     result.map(|_| false).map_err(|e| e.into())

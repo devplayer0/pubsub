@@ -66,10 +66,15 @@ fn encode_conn_packet() {
     let connect = Packet::make_connect(vec![0; 4]);
     assert!(Packet::validate_connect(&connect).is_ok());
 }
+
+#[inline]
+fn test_gbn() -> GoBackN {
+    GoBackN::new(UdpSocket::bind("127.0.0.1:0").unwrap())
+}
 #[test]
 fn invalid_packet_type() {
     let packet = vec![(31 << SEQ_BITS)].into();
-    assert!(match Packet::try_from(&packet).unwrap_err() {
+    assert!(match test_gbn().decode(&packet).unwrap_err() {
         DecodeError::InvalidType(31) => true,
         _ => false,
     })
@@ -78,13 +83,13 @@ fn invalid_packet_type() {
 fn decode_ack() {
     // packet type 1, seq 7
     let ack = vec![(1 << SEQ_BITS) | 7].into();
-    assert!(match Packet::try_from(&ack).unwrap() {
+    assert!(match test_gbn().decode(&ack).unwrap() {
         Packet::Ack(7) => true,
         _ => false,
     });
 
     let bad_ack = vec![(1 << SEQ_BITS) | 7, 123].into();
-    assert!(match Packet::try_from(&bad_ack).unwrap_err() {
+    assert!(match test_gbn().decode(&bad_ack).unwrap_err() {
         DecodeError::Malformed(PacketType::Ack) => true,
         _ => false,
     });
