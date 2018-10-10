@@ -218,7 +218,7 @@ impl GoBackN {
     }
 
     pub fn handle_ack(&mut self, src: SocketAddr, seq: u8) -> LinkedList<Data> {
-        if !seq_in_window(self.send_buffer_sseq, seq) {
+        if !seq_in_window(self.send_buffer_sseq, seq) || slide_amount(self.send_buffer_sseq, seq) as usize > self.send_buffer.len() {
             warn!("received ack from {} outside of window", src);
             return LinkedList::new();
         }

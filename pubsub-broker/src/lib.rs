@@ -1,11 +1,9 @@
-use std::error::Error as StdError;
 use std::any::Any;
-use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use std::collections::HashMap;
-use std::thread::{self, ThreadId, JoinHandle};
+use std::thread::{self, ThreadId};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Condvar};
+use std::sync::{Arc, Mutex};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
@@ -22,11 +20,15 @@ extern crate pubsub_common as common;
 use crossbeam::channel::{self, Sender, Receiver};
 use crossbeam::queue::MsQueue;
 
-use common::{Data, Packet, GoBackN};
+use common::Data;
 
 pub mod config;
+mod timer;
+mod client;
+mod worker;
 
-use config::Config;
+use client::Client;
+use worker::{Worker, WorkerMessage};
 
 quick_error! {
     #[derive(Debug)]
@@ -47,190 +49,6 @@ quick_error! {
             cause(err)
         }
         InvalidPacketType
-    }
-}
-
-enum WorkerMessage {
-    Packet(SocketAddr, Data),
-    Disconnect(SocketAddr),
-    Shutdown,
-}
-
-#[derive(Debug)]
-struct Client {
-    addr: SocketAddr,
-    buffers: Arc<MsQueue<Vec<u8>>>,
-    gbn: GoBackN,
-
-    pub connected: bool,
-}
-impl Hash for Client {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-    }
-}
-impl PartialEq for Client {
-    fn eq(&self, other: &Client) -> bool {
-        other.addr == self.addr
-    }
-}
-impl Client {
-    pub fn new(addr: SocketAddr, socket: UdpSocket, buffers: Arc<MsQueue<Vec<u8>>>) -> Client {
-        Client {
-            addr,
-            buffers,
-            gbn: GoBackN::new(socket),
-
-            connected: false,
-        }
-    }
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-    pub fn gbn(&mut self) -> &mut GoBackN {
-        &mut self.gbn
-    }
-
-    pub fn send_heartbeat(&self) -> Result<(), Error> {
-        self.buffers.push(self.gbn.send_heartbeat(self.addr, self.buffers.pop())?);
-        Ok(())
-    }
-    pub fn send_disconnect(&self) -> Result<(), Error> {
-        self.buffers.push(self.gbn.send_disconnect(self.addr, self.buffers.pop())?);
-        Ok(())
-    }
-    pub fn handle(&mut self, packet: Packet) -> Result<(), Error> {
-        match packet {
-            Packet::Ack(seq) => {
-                for buffer in self.gbn.handle_ack(self.addr, seq) {
-                    self.buffers.push(buffer.take());
-                }
-            },
-            Packet::Heartbeat => {
-                // TODO: timeout
-                debug!("got heartbeat from {}", self.addr);
-            },
-            Packet::Subscribe(topic) => {
-                info!("{} wants to subscribe to '{}'", self.addr, topic)
-            },
-            _ => return Err(Error::InvalidPacketType)
-        }
-
-        Ok(())
-    }
-}
-impl Eq for Client {}
-
-#[derive(Debug)]
-struct Worker {
-    clients: Arc<RwLock<HashMap<SocketAddr, Mutex<Client>>>>,
-    tx: Sender<WorkerMessage>,
-    thread: JoinHandle<()>,
-}
-impl Worker {
-    pub fn new(buffers: Arc<MsQueue<Vec<u8>>>, disconnect_tx: Sender<WorkerMessage>) -> Worker {
-        let clients: Arc<RwLock<HashMap<_, Mutex<Client>>>> = Arc::new(RwLock::new(HashMap::new()));
-        let (tx, rx) = channel::unbounded();
-        let thread = {
-            let clients = Arc::clone(&clients);
-            thread::spawn(move || {
-                for msg in rx {
-                    match msg {
-                        WorkerMessage::Packet(src, data) => {
-                            let r_clients = clients.read().unwrap();
-
-                            trace!("worker from thread {:?} got a packet of {} bytes from {}!", thread::current().id(), data.len(), src);
-                            if !r_clients[&src].lock().unwrap().connected {
-                                if let Err(_) = Packet::validate_connect(&data) {
-                                    warn!("received invalid connection packet from {}", src);
-                                    drop(r_clients);
-                                    clients.write().unwrap().remove(&src);
-                                    disconnect_tx.send(WorkerMessage::Disconnect(src));
-                                } else {
-                                    let ret = {
-                                        let mut client = r_clients[&src].lock().unwrap();
-                                        client.connected = true;
-                                        client.send_heartbeat()
-                                    };
-                                    if let Err(e) = ret {
-                                        error!("failed to send connack to {}: {}", src, e);
-                                        drop(r_clients);
-                                        clients.write().unwrap().remove(&src);
-                                        disconnect_tx.send(WorkerMessage::Disconnect(src));
-                                    } else {
-                                        debug!("got connection from {}", src);
-                                    }
-                                }
-
-                                buffers.push(data.take());
-                                continue;
-                            }
-
-                            let result = {
-                                let mut client = r_clients[&src].lock().unwrap();
-                                let result = client.gbn().decode(src, &data);
-                                match result {
-                                    Ok(packet) => match packet {
-                                        Packet::Disconnect => {
-                                            Ok(true)
-                                        },
-                                        _ => client.handle(packet).map(|_| false),
-                                    },
-                                    Err(e@common::DecodeError::OutOfOrder(_, _)) => {
-                                        warn!("{}", e);
-                                        Ok(false)
-                                    },
-                                    Err(e) => Err(e.into())
-                                }
-                            };
-                            match result {
-                                Ok(true) => {
-                                    debug!("disconnecting client {}", src);
-                                    if let Err(e) = r_clients[&src].lock().unwrap().send_disconnect() {
-                                        warn!("error while sending disconnect packet to {}: {}", src, e);
-                                    }
-
-                                    drop(r_clients);
-                                    clients.write().unwrap().remove(&src);
-                                    disconnect_tx.send(WorkerMessage::Disconnect(src));
-                                },
-                                Err(e) => match e {
-                                    Error::InvalidPacketType | Error::Decode(_) => {
-                                        error!("received invalid/malformed packet from {}: {}, disconnecting...", src, e);
-                                        drop(r_clients);
-                                        clients.write().unwrap().remove(&src);
-                                        disconnect_tx.send(WorkerMessage::Disconnect(src));
-                                    },
-                                    _ => error!("error while processing packet from {}: {}", src, e)
-                                },
-
-                                Ok(false) => {},
-                            }
-                            buffers.push(data.take());
-                        },
-                        WorkerMessage::Shutdown => break,
-                        _ => panic!("impossible"),
-                    }
-                }
-            })
-        };
-
-        Worker {
-            clients,
-            tx,
-            thread,
-        }
-    }
-    pub fn tx(&self) -> Sender<WorkerMessage> {
-        self.tx.clone()
-    }
-    pub fn stop(self) -> Result<(), Error> {
-        self.tx.send(WorkerMessage::Shutdown);
-        let tid = self.thread.thread().id();
-        self.thread.join().map_err(|e| Error::ThreadPanic((tid, Box::new(e))))
-    }
-    pub fn assign(&self, client: Client) {
-        self.clients.write().unwrap().insert(client.addr(), Mutex::new(client));
     }
 }
 
@@ -383,33 +201,3 @@ impl Broker {
     }
 }
 
-pub fn run(config: Config) -> Result<(), Box<dyn StdError>> {
-    info!("starting broker");
-
-    let stop = Arc::new((Mutex::new(false), Condvar::new()));
-    {
-        let stop = Arc::clone(&stop);
-        ctrlc::set_handler(move || {
-            let &(ref stop_lock, ref stop_cond) = &*stop;
-
-            let mut stop = stop_lock.lock().unwrap();
-            if *stop {
-                return;
-            }
-
-            info!("shutting down...");
-            *stop = true;
-            stop_cond.notify_one();
-        })?;
-    }
-
-    let broker = Broker::bind(config.bind_addrs())?;
-
-    let &(ref stop_lock, ref stop_cond) = &*stop;
-    let mut stop = stop_lock.lock().unwrap();
-    while !*stop {
-        stop = stop_cond.wait(stop).unwrap();
-    }
-
-    broker.stop().map_err(|e| Box::new(e) as Box<dyn StdError>)
-}
