@@ -10,6 +10,7 @@ use ::common::{self, Data, Packet};
 use ::Error;
 use ::client::Client;
 
+#[derive(PartialEq, Eq, Hash)]
 pub enum WorkerMessage {
     Packet(SocketAddr, Data),
     Disconnect(SocketAddr),

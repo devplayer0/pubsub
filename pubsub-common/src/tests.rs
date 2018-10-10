@@ -1,8 +1,34 @@
 use super::*;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
+use std::thread;
 
 lazy_static! {
     static ref DUMMY_ADDRESS: SocketAddr = SocketAddr::from_str("127.0.0.1:1234").unwrap();
+}
+
+#[test]
+fn timer() {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let timers: TimerManager<&str> = TimerManager::new();
+    let id = timers.register(&tx);
+
+    let start_b = Instant::now();
+    timers.post_message(id, "general kenobi...", start_b + Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(50));
+
+    let to_cancel = timers.post_message(id, "it's treason then!", Instant::now() + Duration::from_millis(20));
+    assert!(timers.cancel_message(to_cancel));
+
+    let start_a = Instant::now();
+    timers.post_message(id, "hello there!", start_a + Duration::from_millis(100));
+
+    assert_eq!(rx.recv().unwrap(), "hello there!");
+    println!("hello there @ +{:#?}", Instant::now() - start_a);
+    assert_eq!(rx.recv().unwrap(), "general kenobi...");
+    println!("general kenobi @ +{:#?}", Instant::now() - start_b);
+
+    timers.stop();
 }
 
 #[test]

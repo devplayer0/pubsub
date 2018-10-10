@@ -2,6 +2,7 @@
 
 use std::ops::Deref;
 use std::cmp;
+use std::hash::{Hash, Hasher};
 use std::fmt::{self, Display};
 use std::string::FromUtf8Error;
 use std::collections::LinkedList;
@@ -15,12 +16,17 @@ extern crate log;
 #[macro_use]
 extern crate enum_primitive;
 extern crate byteorder;
+extern crate crossbeam_channel;
+extern crate priority_queue;
 
 #[cfg(test)]
 #[macro_use]
 extern crate lazy_static;
 
 use enum_primitive::FromPrimitive;
+
+pub mod timer;
+pub use timer::TimerManager;
 
 pub const IPV4_MAX_PACKET_SIZE: usize = 508;
 pub const IPV6_MAX_PACKET_SIZE: usize = 1212;
@@ -89,7 +95,7 @@ quick_error! {
     }
 }
 
-#[derive(Debug)]
+#[derive(Eq, Debug)]
 pub struct Data {
     buffer: Vec<u8>,
     size: usize,
@@ -123,6 +129,16 @@ impl From<Vec<u8>> for Data {
 impl Clone for Data {
     fn clone(&self) -> Self {
         Data::from_buffer(self.buffer.clone(), self.size)
+    }
+}
+impl PartialEq for Data {
+    fn eq(&self, other: &Data) -> bool {
+        self.buffer == other.buffer
+    }
+}
+impl Hash for Data {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.buffer.hash(state);
     }
 }
 

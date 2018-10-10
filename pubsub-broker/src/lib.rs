@@ -23,7 +23,6 @@ use crossbeam::queue::MsQueue;
 use common::Data;
 
 pub mod config;
-mod timer;
 mod client;
 mod worker;
 
