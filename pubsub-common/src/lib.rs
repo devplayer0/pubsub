@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::fmt::{self, Display};
 use std::string::FromUtf8Error;
 use std::collections::LinkedList;
+use std::time::{Duration, Instant};
 use std::io::{self, Write, Cursor};
 use std::net::{SocketAddr, UdpSocket};
 
@@ -24,6 +25,7 @@ extern crate priority_queue;
 extern crate lazy_static;
 
 use enum_primitive::FromPrimitive;
+use crossbeam_channel::Receiver;
 
 pub mod timer;
 pub use timer::TimerManager;
@@ -34,6 +36,7 @@ pub const IPV6_MAX_PACKET_SIZE: usize = 1212;
 pub const SEQ_BITS: u8 = 3;
 pub const SEQ_RANGE: u8 = 8;
 pub const WINDOW_SIZE: u8 = SEQ_RANGE - 1;
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const CONNECT_MAGIC: &'static [u8] = b"JQTT";
 pub const MAX_TOPIC_LENGTH: usize = IPV4_MAX_PACKET_SIZE - 1;
@@ -210,9 +213,18 @@ impl Packet {
     }
 }
 
+#[derive(PartialEq, Eq, Hash, Debug)]
+pub enum GbnTimeout {
+    Heartbeat,
+}
 #[derive(Debug)]
 pub struct GoBackN {
+    timers: TimerManager<GbnTimeout>,
     socket: UdpSocket,
+
+    timers_client: usize,
+    timeout_rx: Receiver<GbnTimeout>,
+    heartbeat_timeout: Option<usize>,
 
     send_buffer: LinkedList<Data>,
     send_buffer_sseq: u8,
@@ -221,9 +233,20 @@ pub struct GoBackN {
     recv_seq: u8,
 }
 impl GoBackN {
-    pub fn new(socket: UdpSocket) -> GoBackN {
+    pub fn new(timers: &TimerManager<GbnTimeout>, socket: UdpSocket, use_heartbeats: bool) -> GoBackN {
+        let (timeout_tx, timeout_rx) = crossbeam_channel::unbounded();
+        let timers_client = timers.register(&timeout_tx);
+        let heartbeat_timeout = match use_heartbeats {
+            true => Some(timers.post_message(timers_client, GbnTimeout::Heartbeat, Instant::now() + HEARTBEAT_TIMEOUT)),
+            false => None
+        };
         GoBackN {
+            timers: timers.clone(),
             socket,
+
+            timers_client,
+            timeout_rx,
+            heartbeat_timeout,
 
             send_buffer: LinkedList::new(),
             send_buffer_sseq: 0,
@@ -269,7 +292,14 @@ impl GoBackN {
             return match t {
                 Connect => Err(AlreadyConnected),
                 Heartbeat => match buffer.len() {
-                    1 if seq == 0 => Ok(Packet::Heartbeat),
+                    1 if seq == 0 => {
+                        if let Some(timer) = self.heartbeat_timeout {
+                            self.timers.cancel_message(timer);
+                            self.heartbeat_timeout = Some(self.timers.post_message(self.timers_client, GbnTimeout::Heartbeat, Instant::now() + HEARTBEAT_TIMEOUT));
+                        }
+
+                        Ok(Packet::Heartbeat)
+                    },
                     _ => Err(Malformed(Heartbeat)),
                 },
                 Ack => match buffer.len() {

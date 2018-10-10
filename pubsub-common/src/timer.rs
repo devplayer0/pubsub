@@ -10,7 +10,7 @@ use std::time::Instant;
 use crossbeam_channel::Sender;
 use priority_queue::PriorityQueue;
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 struct ReverseInstant(Instant);
 impl Ord for ReverseInstant {
     fn cmp(&self, other: &ReverseInstant) -> Ordering {
@@ -33,7 +33,7 @@ impl Into<Instant> for ReverseInstant {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 struct Timer<M: Send + Eq + Hash + 'static> {
     id: usize,
     client: usize,
@@ -51,15 +51,30 @@ impl<M: Send + Eq + Hash + 'static> Timer<M> {
     }
 }
 
+#[derive(Debug)]
 pub struct TimerManager<M: Send + Eq + Hash + 'static> {
     clients: Arc<RwLock<HashMap<usize, Sender<M>>>>,
-    next_client_id: AtomicUsize,
+    next_client_id: Arc<AtomicUsize>,
     timers: Arc<Mutex<PriorityQueue<Timer<M>, ReverseInstant>>>,
-    next_id: AtomicUsize,
+    next_id: Arc<AtomicUsize>,
 
-    thread: JoinHandle<()>,
+    thread: Arc<JoinHandle<()>>,
     running: Arc<Mutex<bool>>,
     wakeup_tx: mpsc::SyncSender<()>,
+}
+impl<M: Send + Eq + Hash + 'static> Clone for TimerManager<M> {
+    fn clone(&self) -> TimerManager<M> {
+        TimerManager {
+            clients: Arc::clone(&self.clients),
+            next_client_id: Arc::clone(&self.next_client_id),
+            timers: Arc::clone(&self.timers),
+            next_id: Arc::clone(&self.next_id),
+
+            thread: Arc::clone(&self.thread),
+            running: Arc::clone(&self.running),
+            wakeup_tx: self.wakeup_tx.clone(),
+        }
+    }
 }
 impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
     pub fn new() -> TimerManager<M> {
@@ -67,7 +82,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         let clients: Arc<RwLock<HashMap<_, Sender<M>>>> = Arc::new(RwLock::new(HashMap::new()));
         let timers: Arc<Mutex<PriorityQueue<Timer<M>, ReverseInstant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
         let (wakeup_tx, wakeup_rx) = mpsc::sync_channel(0);
-        let thread = {
+        let thread = Arc::new({
             let running_lock = Arc::clone(&running);
             let clients = Arc::clone(&clients);
             let timers = Arc::clone(&timers);
@@ -103,13 +118,13 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
                     }
                 }
             })
-        };
+        });
 
         TimerManager {
             clients,
-            next_client_id: AtomicUsize::new(0),
+            next_client_id: Arc::new(AtomicUsize::new(0)),
             timers,
-            next_id: AtomicUsize::new(0),
+            next_id: Arc::new(AtomicUsize::new(0)),
 
             thread,
             running,
@@ -153,8 +168,12 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
     }
 
     pub fn stop(self) {
+        if !*self.running.lock().unwrap() {
+            return;
+        }
+
         *self.running.lock().unwrap() = false;
         let _ = self.wakeup_tx.send(());
-        self.thread.join().unwrap();
+        Arc::try_unwrap(self.thread).unwrap().join().unwrap();
     }
 }

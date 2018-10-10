@@ -20,7 +20,7 @@ extern crate pubsub_common as common;
 use crossbeam::channel::{self, Sender, Receiver};
 use crossbeam::queue::MsQueue;
 
-use common::Data;
+use common::{TimerManager, Data, GbnTimeout};
 
 pub mod config;
 mod client;
@@ -53,27 +53,34 @@ quick_error! {
 
 #[derive(Debug)]
 struct WorkerManager {
+    timers: TimerManager<GbnTimeout>,
     sockets: HashMap<SocketAddr, UdpSocket>,
     buffers: Arc<MsQueue<Vec<u8>>>,
+
     next_worker: usize,
     workers: Vec<Worker>,
+
     client_assignments: HashMap<SocketAddr, Sender<WorkerMessage>>,
     disconnect_rx: Receiver<WorkerMessage>,
 }
 impl WorkerManager {
     pub fn new(sockets: Vec<UdpSocket>, buffers: Arc<MsQueue<Vec<u8>>>) -> WorkerManager {
+        let timers = TimerManager::new();
         let mut workers = Vec::with_capacity(num_cpus::get());
         let (disconnect_tx, disconnect_rx) = channel::unbounded();
         info!("creating {} workers...", workers.capacity());
         for _ in 0..workers.capacity() {
-            workers.push(Worker::new(Arc::clone(&buffers), disconnect_tx.clone()));
+            workers.push(Worker::new(&timers, Arc::clone(&buffers), disconnect_tx.clone()));
         }
 
         WorkerManager {
+            timers,
             sockets: sockets.into_iter().map(|s| (s.local_addr().unwrap(), s)).collect(),
             buffers,
+
             workers,
             next_worker: 0,
+
             client_assignments: HashMap::new(),
             disconnect_rx,
         }
@@ -97,7 +104,7 @@ impl WorkerManager {
         }
 
         if !self.client_assignments.contains_key(&client_addr) {
-            let client = Client::new(client_addr, self.sockets[&local_addr].try_clone().unwrap(), Arc::clone(&self.buffers));
+            let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), Arc::clone(&self.buffers));
             let tx = {
                 let worker = self.next_worker();
                 worker.assign(client);
@@ -108,12 +115,11 @@ impl WorkerManager {
 
         self.client_assignments[&client_addr].send(WorkerMessage::Packet(client_addr, data));
     }
-    pub fn stop(self) -> Result<(), Error> {
+    pub fn stop(self) {
         for worker in self.workers {
-            worker.stop()?;
+            worker.stop();
         }
-
-        Ok(())
+        self.timers.stop();
     }
 }
 
@@ -121,7 +127,7 @@ impl WorkerManager {
 pub struct Broker {
     running: Arc<AtomicBool>,
     clients: Arc<Mutex<WorkerManager>>,
-    io_threads: Vec<thread::JoinHandle<Result<(), Error>>>,
+    io_threads: Vec<thread::JoinHandle<()>>,
 }
 impl Broker {
     pub fn bind<'a, I>(addrs: I) -> Result<Broker, Error>
@@ -161,7 +167,10 @@ impl Broker {
                             buffers.push(buffer);
                             continue;
                         },
-                        Err(e) => return Err(Error::Io(e))
+                        Err(e) => {
+                            error!("error while receiving udp packet: {}", e);
+                            continue;
+                        }
                     };
                     if size > match addr {
                         SocketAddr::V4(_) => common::IPV4_MAX_PACKET_SIZE,
@@ -173,8 +182,6 @@ impl Broker {
 
                     clients.lock().unwrap().dispatch(addr, src, Data::from_buffer(buffer, size));
                 }
-
-                Ok(())
             }));
         }
 
@@ -188,15 +195,12 @@ impl Broker {
     pub fn running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
-    pub fn stop(self) -> Result<(), Error> {
+    pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
         for thread in self.io_threads {
-            let tid = thread.thread().id();
-            thread.join().map_err(|e| Error::ThreadPanic((tid, Box::new(e))))??;
+            thread.join().unwrap();
         }
-        Arc::try_unwrap(self.clients).unwrap().into_inner().unwrap().stop()?;
-
-        Ok(())
+        Arc::try_unwrap(self.clients).unwrap().into_inner().unwrap().stop();
     }
 }
 

@@ -4,7 +4,7 @@ use std::net::{SocketAddr, UdpSocket};
 
 use crossbeam::queue::MsQueue;
 
-use common::{Packet, GoBackN};
+use common::{TimerManager, Packet, GoBackN, GbnTimeout};
 use ::Error;
 
 #[derive(Debug)]
@@ -26,11 +26,11 @@ impl PartialEq for Client {
     }
 }
 impl Client {
-    pub fn new(addr: SocketAddr, socket: UdpSocket, buffers: Arc<MsQueue<Vec<u8>>>) -> Client {
+    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buffers: Arc<MsQueue<Vec<u8>>>) -> Client {
         Client {
             addr,
             buffers,
-            gbn: GoBackN::new(socket),
+            gbn: GoBackN::new(timers, socket, true),
 
             connected: false,
         }

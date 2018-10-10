@@ -41,7 +41,8 @@ fn run(config: Config) -> Result<(), Box<dyn StdError>> {
         stop = stop_cond.wait(stop).unwrap();
     }
 
-    broker.stop().map_err(|e| Box::new(e) as Box<dyn StdError>)
+    broker.stop();
+    Ok(())
 }
 fn main() {
     TermLogger::init(LevelFilter::Debug, simplelog::Config::default()).expect("failed to initialize logger");

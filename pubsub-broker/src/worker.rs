@@ -6,11 +6,11 @@ use std::net::SocketAddr;
 use crossbeam::queue::MsQueue;
 use crossbeam::channel::{self, Sender};
 
-use ::common::{self, Data, Packet};
+use ::common::{self, TimerManager, Data, Packet, GbnTimeout};
 use ::Error;
-use ::client::Client;
+use ::client::{Client};
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub enum WorkerMessage {
     Packet(SocketAddr, Data),
     Disconnect(SocketAddr),
@@ -19,12 +19,13 @@ pub enum WorkerMessage {
 
 #[derive(Debug)]
 pub struct Worker {
+    timers: TimerManager<GbnTimeout>,
     clients: Arc<RwLock<HashMap<SocketAddr, Mutex<Client>>>>,
     tx: Sender<WorkerMessage>,
     thread: JoinHandle<()>,
 }
 impl Worker {
-    pub fn new(buffers: Arc<MsQueue<Vec<u8>>>, disconnect_tx: Sender<WorkerMessage>) -> Worker {
+    pub fn new(timers: &TimerManager<GbnTimeout>, buffers: Arc<MsQueue<Vec<u8>>>, disconnect_tx: Sender<WorkerMessage>) -> Worker {
         let clients: Arc<RwLock<HashMap<_, Mutex<Client>>>> = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = channel::unbounded();
         let thread = {
@@ -112,6 +113,7 @@ impl Worker {
         };
 
         Worker {
+            timers: timers.clone(),
             clients,
             tx,
             thread,
@@ -120,10 +122,9 @@ impl Worker {
     pub fn tx(&self) -> Sender<WorkerMessage> {
         self.tx.clone()
     }
-    pub fn stop(self) -> Result<(), Error> {
+    pub fn stop(self) {
         self.tx.send(WorkerMessage::Shutdown);
-        let tid = self.thread.thread().id();
-        self.thread.join().map_err(|e| Error::ThreadPanic((tid, Box::new(e))))
+        self.thread.join().unwrap();
     }
     pub fn assign(&self, client: Client) {
         self.clients.write().unwrap().insert(client.addr(), Mutex::new(client));
