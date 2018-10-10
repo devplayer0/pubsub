@@ -3,9 +3,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use std::thread;
 
-lazy_static! {
-    static ref DUMMY_ADDRESS: SocketAddr = SocketAddr::from_str("127.0.0.1:1234").unwrap();
-}
+use crossbeam_channel as channel;
 
 #[test]
 fn timer() {
@@ -101,12 +99,13 @@ fn encode_conn_packet() {
 
 #[inline]
 fn test_gbn() -> GoBackN {
-    GoBackN::new(&TimerManager::new(), UdpSocket::bind("127.0.0.1:0").unwrap(), false)
+    let (tx, _) = channel::unbounded();
+    GoBackN::new(&TimerManager::new(), SocketAddr::from_str("127.0.0.1:1234").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), &tx, false)
 }
 #[test]
 fn invalid_packet_type() {
     let packet = vec![(31 << SEQ_BITS)].into();
-    assert!(match test_gbn().decode(*DUMMY_ADDRESS, &packet).unwrap_err() {
+    assert!(match test_gbn().decode(&packet).unwrap_err() {
         DecodeError::InvalidType(31) => true,
         _ => false,
     })
@@ -115,13 +114,13 @@ fn invalid_packet_type() {
 fn decode_ack() {
     // packet type 2, seq 7
     let ack = vec![(2 << SEQ_BITS) | 7].into();
-    assert!(match test_gbn().decode(*DUMMY_ADDRESS, &ack).unwrap() {
+    assert!(match test_gbn().decode(&ack).unwrap() {
         Packet::Ack(7) => true,
         _ => false,
     });
 
     let bad_ack = vec![(2 << SEQ_BITS) | 7, 123].into();
-    assert!(match test_gbn().decode(*DUMMY_ADDRESS, &bad_ack).unwrap_err() {
+    assert!(match test_gbn().decode(&bad_ack).unwrap_err() {
         DecodeError::Malformed(PacketType::Ack) => true,
         _ => false,
     });
@@ -131,7 +130,7 @@ fn decode_ack() {
 fn decode_subscribe() {
     // packet type 4, seq 0
     let subscribe = vec![(4 << SEQ_BITS) | 0, b'm', b'e', b'm', b'e', b's', b' ', 0xf0, 0x9f, 0xa4, 0x94].into();
-    assert!(match &test_gbn().decode(*DUMMY_ADDRESS, &subscribe) {
+    assert!(match &test_gbn().decode(&subscribe) {
         Ok(Packet::Subscribe(msg)) if msg == "memes 🤔" => true,
         Err(e) => {
             println!("{}", e);
@@ -143,5 +142,5 @@ fn decode_subscribe() {
 #[test]
 fn encode_subscribe() {
     let topic = Packet::make_subscribe(vec![0; 11], "memes 🤔", 0);
-    assert!(test_gbn().decode(*DUMMY_ADDRESS, &topic).is_ok());
+    assert!(test_gbn().decode(&topic).is_ok());
 }

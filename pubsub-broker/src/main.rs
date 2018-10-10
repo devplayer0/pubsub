@@ -33,7 +33,7 @@ fn run(config: Config) -> Result<(), Box<dyn StdError>> {
         })?;
     }
 
-    let broker = Broker::bind(config.bind_addrs())?;
+    let broker = Broker::bind(config.bind_addrs(), true)?;
 
     let &(ref stop_lock, ref stop_cond) = &*stop;
     let mut stop = stop_lock.lock().unwrap();

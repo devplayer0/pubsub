@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::net::{SocketAddr, UdpSocket};
 
 use crossbeam::queue::MsQueue;
+use crossbeam::channel::Sender;
 
 use common::timer::TimerManager;
 use common::{Packet, GoBackN, GbnTimeout};
@@ -27,11 +28,11 @@ impl PartialEq for Client {
     }
 }
 impl Client {
-    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buffers: Arc<MsQueue<Vec<u8>>>) -> Client {
+    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buffers: Arc<MsQueue<Vec<u8>>>, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> Client {
         Client {
             addr,
             buffers,
-            gbn: GoBackN::new(timers, socket, true),
+            gbn: GoBackN::new(timers, addr, socket, timeout_tx, use_heartbeats),
 
             connected: false,
         }
@@ -54,7 +55,7 @@ impl Client {
     pub fn handle(&mut self, packet: Packet) -> Result<(), Error> {
         match packet {
             Packet::Ack(seq) => {
-                for buffer in self.gbn.handle_ack(self.addr, seq) {
+                for buffer in self.gbn.handle_ack(seq) {
                     self.buffers.push(buffer.take());
                 }
             },

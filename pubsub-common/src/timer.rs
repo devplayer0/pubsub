@@ -106,6 +106,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
 
                     if cancelled {
                         timers.lock().unwrap().pop().unwrap();
+                        continue;
                     }
                     if Instant::now() > time {
                         let (timer, _) = timers.lock().unwrap().pop().unwrap();
@@ -141,8 +142,8 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         self.clients.write().unwrap().insert(id, client.clone());
         TimerManagerClient(id)
     }
-    pub fn unregister(&self, client: usize) {
-        self.clients.write().unwrap().remove(&client);
+    pub fn unregister(&self, client: TimerManagerClient) {
+        self.clients.write().unwrap().remove(&client.0);
     }
     pub fn post_message(&self, client: TimerManagerClient, message: M, when: Instant) -> Timer {
         let id = self.next_id.fetch_add(1, AtOrdering::Relaxed);

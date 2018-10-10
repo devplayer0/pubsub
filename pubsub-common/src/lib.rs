@@ -20,12 +20,8 @@ extern crate byteorder;
 extern crate crossbeam_channel;
 extern crate priority_queue;
 
-#[cfg(test)]
-#[macro_use]
-extern crate lazy_static;
-
 use enum_primitive::FromPrimitive;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
 
 pub mod timer;
 use timer::{TimerManager, TimerManagerClient, Timer};
@@ -215,15 +211,15 @@ impl Packet {
 
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum GbnTimeout {
-    Heartbeat,
+    Heartbeat(SocketAddr),
 }
 #[derive(Debug)]
 pub struct GoBackN {
     timers: TimerManager<GbnTimeout>,
+    addr: SocketAddr,
     socket: UdpSocket,
 
     timers_client: TimerManagerClient,
-    timeout_rx: Receiver<GbnTimeout>,
     heartbeat_timeout: Option<Timer>,
 
     send_buffer: LinkedList<Data>,
@@ -232,20 +228,27 @@ pub struct GoBackN {
 
     recv_seq: u8,
 }
+impl Drop for GoBackN {
+    fn drop(&mut self) {
+        if let Some(timer) = self.heartbeat_timeout {
+            self.timers.cancel_message(timer);
+        }
+        self.timers.unregister(self.timers_client);
+    }
+}
 impl GoBackN {
-    pub fn new(timers: &TimerManager<GbnTimeout>, socket: UdpSocket, use_heartbeats: bool) -> GoBackN {
-        let (timeout_tx, timeout_rx) = crossbeam_channel::unbounded();
+    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> GoBackN {
         let timers_client = timers.register(&timeout_tx);
         let heartbeat_timeout = match use_heartbeats {
-            true => Some(timers.post_message(timers_client, GbnTimeout::Heartbeat, Instant::now() + HEARTBEAT_TIMEOUT)),
+            true => Some(timers.post_message(timers_client, GbnTimeout::Heartbeat(addr), Instant::now() + HEARTBEAT_TIMEOUT)),
             false => None
         };
         GoBackN {
             timers: timers.clone(),
+            addr,
             socket,
 
             timers_client,
-            timeout_rx,
             heartbeat_timeout,
 
             send_buffer: LinkedList::new(),
@@ -256,9 +259,9 @@ impl GoBackN {
         }
     }
 
-    pub fn handle_ack(&mut self, src: SocketAddr, seq: u8) -> LinkedList<Data> {
+    pub fn handle_ack(&mut self, seq: u8) -> LinkedList<Data> {
         if !seq_in_window(self.send_buffer_sseq, seq) || slide_amount(self.send_buffer_sseq, seq) as usize > self.send_buffer.len() {
-            warn!("received ack from {} outside of window", src);
+            warn!("received ack from {} outside of window", self.addr);
             return LinkedList::new();
         }
 
@@ -269,16 +272,16 @@ impl GoBackN {
         self.send_seq = self.send_buffer_sseq;
         acknowledged
     }
-    fn recv_slide(&mut self, src: SocketAddr, seq: u8) -> Result<(), DecodeError> {
+    fn recv_slide(&mut self, seq: u8) -> Result<(), DecodeError> {
         if seq != self.recv_seq {
             return Err(DecodeError::OutOfOrder(self.recv_seq, seq));
         }
 
-        self.socket.send_to(&[(PacketType::Ack as u8) << SEQ_BITS | seq], src)?;
+        self.socket.send_to(&[(PacketType::Ack as u8) << SEQ_BITS | seq], self.addr)?;
         self.recv_seq = next_seq(seq);
         Ok(())
     }
-    pub fn decode(&mut self, src: SocketAddr, buffer: &Data) -> Result<Packet, DecodeError> {
+    pub fn decode(&mut self, buffer: &Data) -> Result<Packet, DecodeError> {
         use DecodeError::*;
         use PacketType::*;
 
@@ -295,7 +298,7 @@ impl GoBackN {
                     1 if seq == 0 => {
                         if let Some(timer) = self.heartbeat_timeout {
                             self.timers.cancel_message(timer);
-                            self.heartbeat_timeout = Some(self.timers.post_message(self.timers_client, GbnTimeout::Heartbeat, Instant::now() + HEARTBEAT_TIMEOUT));
+                            self.heartbeat_timeout = Some(self.timers.post_message(self.timers_client, GbnTimeout::Heartbeat(self.addr), Instant::now() + HEARTBEAT_TIMEOUT));
                         }
 
                         Ok(Packet::Heartbeat)
@@ -311,7 +314,7 @@ impl GoBackN {
                     _ => Err(Malformed(Disconnect)),
                 },
                 Subscribe => if buffer.len() > 1 {
-                    self.recv_slide(src, seq)?;
+                    self.recv_slide(seq)?;
                     Ok(Packet::Subscribe(String::from_utf8(buffer[1..].into())?))
                 } else {
                     Err(Malformed(Subscribe))

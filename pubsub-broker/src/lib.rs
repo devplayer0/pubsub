@@ -2,7 +2,7 @@ use std::any::Any;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::thread::{self, ThreadId};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -13,6 +13,7 @@ extern crate quick_error;
 extern crate log;
 extern crate ctrlc;
 extern crate num_cpus;
+#[macro_use]
 extern crate crossbeam;
 
 extern crate pubsub_common as common;
@@ -58,14 +59,15 @@ struct WorkerManager {
     sockets: HashMap<SocketAddr, UdpSocket>,
     buffers: Arc<MsQueue<Vec<u8>>>,
 
-    next_worker: usize,
+    use_heartbeats: bool,
+    next_worker: AtomicUsize,
     workers: Vec<Worker>,
 
     client_assignments: HashMap<SocketAddr, Sender<WorkerMessage>>,
     disconnect_rx: Receiver<WorkerMessage>,
 }
 impl WorkerManager {
-    pub fn new(sockets: Vec<UdpSocket>, buffers: Arc<MsQueue<Vec<u8>>>) -> WorkerManager {
+    pub fn new(sockets: Vec<UdpSocket>, buffers: Arc<MsQueue<Vec<u8>>>, use_heartbeats: bool) -> WorkerManager {
         let timers = TimerManager::new();
         let mut workers = Vec::with_capacity(num_cpus::get());
         let (disconnect_tx, disconnect_rx) = channel::unbounded();
@@ -79,19 +81,19 @@ impl WorkerManager {
             sockets: sockets.into_iter().map(|s| (s.local_addr().unwrap(), s)).collect(),
             buffers,
 
+            use_heartbeats,
             workers,
-            next_worker: 0,
+            next_worker: AtomicUsize::new(0),
 
             client_assignments: HashMap::new(),
             disconnect_rx,
         }
     }
 
-    fn next_worker(&mut self) -> &Worker {
-        let worker = &self.workers[self.next_worker];
-        self.next_worker += 1;
-        if self.next_worker == self.workers.len() {
-            self.next_worker = 0;
+    fn next_worker(&self) -> &Worker {
+        let worker = &self.workers[self.next_worker.fetch_add(1, Ordering::SeqCst)];
+        if self.next_worker.load(Ordering::SeqCst) == self.workers.len() {
+            self.next_worker.store(0, Ordering::SeqCst);
         }
 
         worker
@@ -105,12 +107,14 @@ impl WorkerManager {
         }
 
         if !self.client_assignments.contains_key(&client_addr) {
-            let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), Arc::clone(&self.buffers));
             let tx = {
                 let worker = self.next_worker();
+                let (tx, timeout_tx) = worker.tx();
+                let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), Arc::clone(&self.buffers), &timeout_tx, self.use_heartbeats);
                 worker.assign(client);
-                worker.tx()
+                tx
             };
+
             self.client_assignments.insert(client_addr, tx);
         }
 
@@ -131,7 +135,7 @@ pub struct Broker {
     io_threads: Vec<thread::JoinHandle<()>>,
 }
 impl Broker {
-    pub fn bind<'a, I>(addrs: I) -> Result<Broker, Error>
+    pub fn bind<'a, I>(addrs: I, use_heartbeats: bool) -> Result<Broker, Error>
     where I: IntoIterator<Item = &'a SocketAddr>
     {
         let buffers = Arc::new(MsQueue::new());
@@ -150,7 +154,8 @@ impl Broker {
 
         let clients = Arc::new(Mutex::new(WorkerManager::new(
                     sockets.iter().map(|s| s.try_clone().unwrap()).collect(),
-                    Arc::clone(&buffers))));
+                    Arc::clone(&buffers),
+                    use_heartbeats)));
         let running = Arc::new(AtomicBool::new(true));
         let mut io_threads = Vec::new();
         for socket in sockets {

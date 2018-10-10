@@ -10,6 +10,3 @@ byteorder = "~1.2"
 enum_primitive = "~0.1"
 crossbeam-channel = "~0.2"
 priority-queue = "~0.5"
-
-[dev-dependencies]
-lazy_static = "~1.1"
