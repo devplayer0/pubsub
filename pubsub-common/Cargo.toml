@@ -8,3 +8,6 @@ quick-error = "~1.2"
 log = "~0.4"
 byteorder = "~1.2"
 enum_primitive = "~0.1"
+
+[dev-dependencies]
+lazy_static = "~1.1"

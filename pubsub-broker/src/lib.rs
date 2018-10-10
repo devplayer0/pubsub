@@ -110,6 +110,9 @@ impl Client {
                 // TODO: timeout
                 debug!("got heartbeat from {}", self.addr);
             },
+            Packet::Subscribe(topic) => {
+                info!("{} wants to subscribe to '{}'", self.addr, topic)
+            },
             _ => return Err(Error::InvalidPacketType)
         }
 
@@ -165,16 +168,19 @@ impl Worker {
 
                             let result = {
                                 let mut client = r_clients[&src].lock().unwrap();
-                                let result = client.gbn().decode(&data);
-                                if let Ok(packet) = result {
-                                    match packet {
+                                let result = client.gbn().decode(src, &data);
+                                match result {
+                                    Ok(packet) => match packet {
                                         Packet::Disconnect => {
                                             Ok(true)
                                         },
                                         _ => client.handle(packet).map(|_| false),
-                                    }
-                                } else {
-                                    result.map(|_| false).map_err(|e| e.into())
+                                    },
+                                    Err(e@common::DecodeError::OutOfOrder(_, _)) => {
+                                        warn!("{}", e);
+                                        Ok(false)
+                                    },
+                                    Err(e) => Err(e.into())
                                 }
                             };
                             match result {

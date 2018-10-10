@@ -3,6 +3,7 @@
 use std::ops::Deref;
 use std::cmp;
 use std::fmt::{self, Display};
+use std::string::FromUtf8Error;
 use std::collections::LinkedList;
 use std::io::{self, Write, Cursor};
 use std::net::{SocketAddr, UdpSocket};
@@ -15,6 +16,10 @@ extern crate log;
 extern crate enum_primitive;
 extern crate byteorder;
 
+#[cfg(test)]
+#[macro_use]
+extern crate lazy_static;
+
 use enum_primitive::FromPrimitive;
 
 pub const IPV4_MAX_PACKET_SIZE: usize = 508;
@@ -25,7 +30,6 @@ pub const SEQ_RANGE: u8 = 8;
 pub const WINDOW_SIZE: u8 = SEQ_RANGE - 1;
 
 pub const CONNECT_MAGIC: &'static [u8] = b"JQTT";
-pub const HEARTBEAT_MAGIC: u8 = 5;
 pub const MAX_TOPIC_LENGTH: usize = IPV4_MAX_PACKET_SIZE - 1;
 
 #[inline]
@@ -62,6 +66,25 @@ quick_error! {
         Malformed(packet_type: PacketType) {
             description("malformed packet")
             display("malformed {} packet", packet_type)
+        }
+        AlreadyConnected {
+            description("already connected")
+        }
+        OutOfOrder(expected: u8, seq: u8) {
+            description("out of order packet")
+            display("out of order packet seq {}, expected {}", seq, expected)
+        }
+        AckFail(err: io::Error) {
+            from()
+            cause(err)
+            description(err.description())
+            display("failed to send ack: {}", err)
+        }
+        Utf8Decode(err: FromUtf8Error) {
+            from()
+            cause(err)
+            description(err.description())
+            display("failed to decode string from packet: {}", err)
         }
     }
 }
@@ -106,18 +129,22 @@ impl Clone for Data {
 enum_from_primitive! {
     #[derive(Debug, PartialEq)]
     pub enum PacketType {
-        Heartbeat = 0,
-        Ack = 1,
-        Disconnect = 2,
+        Connect = 0,
+        Heartbeat = 1,
+        Ack = 2,
+        Disconnect = 3,
+        Subscribe = 4,
     }
 }
 impl Display for PacketType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use PacketType::*;
         write!(f, "{}", match self {
+            Connect => "Connect",
             Heartbeat => "HEARTBEAT",
             Ack => "ACK",
             Disconnect => "DISCONNECT",
+            Subscribe => "SUBSCRIBE",
         })
     }
 }
@@ -132,7 +159,9 @@ pub enum Packet {
 }
 impl Packet {
     pub fn validate_connect(buffer: &Data) -> Result<Packet, DecodeError> {
-        if &**buffer != CONNECT_MAGIC {
+        if buffer.len() != 1 + CONNECT_MAGIC.len() || 
+            PacketType::from_u8(buffer[0]) != Some(PacketType::Connect) || 
+            &buffer[1..] != CONNECT_MAGIC {
             return Err(DecodeError::InvalidConnect);
         }
 
@@ -140,17 +169,28 @@ impl Packet {
     }
 
     pub fn make_connect(buffer: Vec<u8>) -> Data {
-        let mut buffer = Data::from_buffer(buffer, CONNECT_MAGIC.len());
-        buffer.cursor().write(&CONNECT_MAGIC).unwrap();
+        let mut buffer = Data::from_buffer(buffer, 1 + CONNECT_MAGIC.len());
+        {
+            let mut cursor = buffer.cursor();
+            cursor.write(&[0]).unwrap();
+            cursor.write(&CONNECT_MAGIC).unwrap();
+        }
         buffer
     }
     pub fn make_heartbeat(mut buffer: Vec<u8>) -> Data {
-        buffer[0] = (PacketType::Heartbeat as u8) << SEQ_BITS | HEARTBEAT_MAGIC;
+        buffer[0] = (PacketType::Heartbeat as u8) << SEQ_BITS;
         Data::from_buffer(buffer, 1)
     }
     pub fn make_disconnect(mut buffer: Vec<u8>) -> Data {
         buffer[0] = (PacketType::Disconnect as u8) << SEQ_BITS;
         Data::from_buffer(buffer, 1)
+    }
+    pub fn make_subscribe(buffer: Vec<u8>, topic: &str, seq: u8) -> Data {
+        let mut cursor = Cursor::new(buffer);
+        cursor.write(&[(PacketType::Subscribe as u8) << SEQ_BITS | seq]).unwrap();
+        cursor.write(topic.as_bytes()).unwrap();
+        let size = cursor.position() as usize;
+        Data::from_buffer(cursor.into_inner(), size)
     }
 }
 
@@ -190,7 +230,16 @@ impl GoBackN {
         self.send_seq = self.send_buffer_sseq;
         acknowledged
     }
-    pub fn decode(&self, buffer: &Data) -> Result<Packet, DecodeError> {
+    fn recv_slide(&mut self, src: SocketAddr, seq: u8) -> Result<(), DecodeError> {
+        if seq != self.recv_seq {
+            return Err(DecodeError::OutOfOrder(self.recv_seq, seq));
+        }
+
+        self.socket.send_to(&[(PacketType::Ack as u8) << SEQ_BITS | seq], src)?;
+        self.recv_seq = next_seq(seq);
+        Ok(())
+    }
+    pub fn decode(&mut self, src: SocketAddr, buffer: &Data) -> Result<Packet, DecodeError> {
         use DecodeError::*;
         use PacketType::*;
 
@@ -202,19 +251,24 @@ impl GoBackN {
         if let Some(t) = PacketType::from_u8(t) {
             let seq = header & (0xff >> (8-SEQ_BITS));
             return match t {
-                Heartbeat => if buffer.len() == 1 && seq == HEARTBEAT_MAGIC {
-                    Ok(Packet::Heartbeat)
-                } else {
-                    Err(Malformed(Heartbeat))
+                Connect => Err(AlreadyConnected),
+                Heartbeat => match buffer.len() {
+                    1 if seq == 0 => Ok(Packet::Heartbeat),
+                    _ => Err(Malformed(Heartbeat)),
                 },
                 Ack => match buffer.len() {
                      1 => Ok(Packet::Ack(seq)),
                      _ => Err(Malformed(Ack)),
                 },
-                Disconnect => if buffer.len() == 1 && seq == 0 {
-                    Ok(Packet::Disconnect)
+                Disconnect => match buffer.len() {
+                    1 if seq == 0 => Ok(Packet::Disconnect),
+                    _ => Err(Malformed(Disconnect)),
+                },
+                Subscribe => if buffer.len() > 1 {
+                    self.recv_slide(src, seq)?;
+                    Ok(Packet::Subscribe(String::from_utf8(buffer[1..].into())?))
                 } else {
-                    Err(Malformed(Disconnect))
+                    Err(Malformed(Subscribe))
                 },
             }
         } else {
