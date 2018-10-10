@@ -4,7 +4,8 @@ use std::net::{SocketAddr, UdpSocket};
 
 use crossbeam::queue::MsQueue;
 
-use common::{TimerManager, Packet, GoBackN, GbnTimeout};
+use common::timer::TimerManager;
+use common::{Packet, GoBackN, GbnTimeout};
 use ::Error;
 
 #[derive(Debug)]

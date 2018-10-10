@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use crossbeam::queue::MsQueue;
 use crossbeam::channel::{self, Sender};
 
-use ::common::{self, TimerManager, Data, Packet, GbnTimeout};
+use ::common::{self, Data, Packet, GbnTimeout};
+use common::timer::TimerManager;
 use ::Error;
 use ::client::{Client};
 

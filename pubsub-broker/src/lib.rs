@@ -20,7 +20,8 @@ extern crate pubsub_common as common;
 use crossbeam::channel::{self, Sender, Receiver};
 use crossbeam::queue::MsQueue;
 
-use common::{TimerManager, Data, GbnTimeout};
+use common::timer::TimerManager;
+use common::{Data, GbnTimeout};
 
 pub mod config;
 mod client;

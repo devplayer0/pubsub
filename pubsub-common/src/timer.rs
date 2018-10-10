@@ -34,15 +34,15 @@ impl Into<Instant> for ReverseInstant {
 }
 
 #[derive(PartialEq, Eq, Hash, Debug)]
-struct Timer<M: Send + Eq + Hash + 'static> {
+struct TimerInfo<M: Send + Eq + Hash + 'static> {
     id: usize,
     client: usize,
     message: M,
     cancelled: bool,
 }
-impl<M: Send + Eq + Hash + 'static> Timer<M> {
-    pub fn new(id: usize, client: usize, message: M) -> Timer<M> {
-        Timer {
+impl<M: Send + Eq + Hash + 'static> TimerInfo<M> {
+    pub fn new(id: usize, client: usize, message: M) -> TimerInfo<M> {
+        TimerInfo {
             id,
             client,
             message,
@@ -51,11 +51,15 @@ impl<M: Send + Eq + Hash + 'static> Timer<M> {
     }
 }
 
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub struct TimerManagerClient(usize);
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub struct Timer(usize);
 #[derive(Debug)]
 pub struct TimerManager<M: Send + Eq + Hash + 'static> {
     clients: Arc<RwLock<HashMap<usize, Sender<M>>>>,
     next_client_id: Arc<AtomicUsize>,
-    timers: Arc<Mutex<PriorityQueue<Timer<M>, ReverseInstant>>>,
+    timers: Arc<Mutex<PriorityQueue<TimerInfo<M>, ReverseInstant>>>,
     next_id: Arc<AtomicUsize>,
 
     thread: Arc<JoinHandle<()>>,
@@ -80,7 +84,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
     pub fn new() -> TimerManager<M> {
         let running = Arc::new(Mutex::new(true));
         let clients: Arc<RwLock<HashMap<_, Sender<M>>>> = Arc::new(RwLock::new(HashMap::new()));
-        let timers: Arc<Mutex<PriorityQueue<Timer<M>, ReverseInstant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
+        let timers: Arc<Mutex<PriorityQueue<TimerInfo<M>, ReverseInstant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
         let (wakeup_tx, wakeup_rx) = mpsc::sync_channel(0);
         let thread = Arc::new({
             let running_lock = Arc::clone(&running);
@@ -132,27 +136,27 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         }
     }
 
-    pub fn register(&self, client: &Sender<M>) -> usize {
+    pub fn register(&self, client: &Sender<M>) -> TimerManagerClient {
         let id = self.next_client_id.fetch_add(1, AtOrdering::Relaxed);
         self.clients.write().unwrap().insert(id, client.clone());
-        id
+        TimerManagerClient(id)
     }
     pub fn unregister(&self, client: usize) {
         self.clients.write().unwrap().remove(&client);
     }
-    pub fn post_message(&self, client: usize, message: M, when: Instant) -> usize {
+    pub fn post_message(&self, client: TimerManagerClient, message: M, when: Instant) -> Timer {
         let id = self.next_id.fetch_add(1, AtOrdering::Relaxed);
-        self.timers.lock().unwrap().push(Timer::new(id, client, message), when.into());
+        self.timers.lock().unwrap().push(TimerInfo::new(id, client.0, message), when.into());
         self.wakeup_tx.send(()).unwrap();
-        id
+        Timer(id)
     }
-    pub fn cancel_message(&self, id: usize) -> bool {
+    pub fn cancel_message(&self, timer: Timer) -> bool {
         let found = {
             let mut found = false;
             let mut timers = self.timers.lock().unwrap();
-            for (timer, _) in timers.iter_mut() {
-                if timer.id == id {
-                    timer.cancelled = true;
+            for (info, _) in timers.iter_mut() {
+                if info.id == timer.0 {
+                    info.cancelled = true;
                     found = true;
                 }
             }

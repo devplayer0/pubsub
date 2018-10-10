@@ -101,7 +101,7 @@ fn encode_conn_packet() {
 
 #[inline]
 fn test_gbn() -> GoBackN {
-    GoBackN::new(UdpSocket::bind("127.0.0.1:0").unwrap())
+    GoBackN::new(&TimerManager::new(), UdpSocket::bind("127.0.0.1:0").unwrap(), false)
 }
 #[test]
 fn invalid_packet_type() {

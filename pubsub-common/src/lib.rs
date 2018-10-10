@@ -28,7 +28,7 @@ use enum_primitive::FromPrimitive;
 use crossbeam_channel::Receiver;
 
 pub mod timer;
-pub use timer::TimerManager;
+use timer::{TimerManager, TimerManagerClient, Timer};
 
 pub const IPV4_MAX_PACKET_SIZE: usize = 508;
 pub const IPV6_MAX_PACKET_SIZE: usize = 1212;
@@ -222,9 +222,9 @@ pub struct GoBackN {
     timers: TimerManager<GbnTimeout>,
     socket: UdpSocket,
 
-    timers_client: usize,
+    timers_client: TimerManagerClient,
     timeout_rx: Receiver<GbnTimeout>,
-    heartbeat_timeout: Option<usize>,
+    heartbeat_timeout: Option<Timer>,
 
     send_buffer: LinkedList<Data>,
     send_buffer_sseq: u8,
