@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, AtomicBool};
 use std::sync::atomic::Ordering as AtOrdering;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -33,21 +33,32 @@ impl Into<Instant> for ReverseInstant {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Debug)]
+#[derive(Debug)]
 struct TimerInfo<M: Send + Eq + Hash + 'static> {
     id: usize,
     client: usize,
     message: M,
-    cancelled: bool,
+    cancelled: Arc<AtomicBool>,
 }
 impl<M: Send + Eq + Hash + 'static> TimerInfo<M> {
     pub fn new(id: usize, client: usize, message: M) -> TimerInfo<M> {
         TimerInfo {
             id,
             client,
-            message,
-            cancelled: false,
+            message: message,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+impl<M: Send + Eq + Hash + 'static> PartialEq for TimerInfo<M> {
+    fn eq(&self, other: &TimerInfo<M>) -> bool {
+        self.id == other.id
+    }
+}
+impl<M: Send + Eq + Hash + 'static> Eq for TimerInfo<M> {}
+impl<M: Send + Eq + Hash + 'static> Hash for TimerInfo<M> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
     }
 }
 
@@ -60,6 +71,7 @@ pub struct TimerManager<M: Send + Eq + Hash + 'static> {
     clients: Arc<RwLock<HashMap<usize, Sender<M>>>>,
     next_client_id: Arc<AtomicUsize>,
     timers: Arc<Mutex<PriorityQueue<TimerInfo<M>, ReverseInstant>>>,
+    cancellations: Arc<Mutex<HashMap<usize, Arc<AtomicBool>>>>,
     next_id: Arc<AtomicUsize>,
 
     thread: Arc<JoinHandle<()>>,
@@ -72,6 +84,7 @@ impl<M: Send + Eq + Hash + 'static> Clone for TimerManager<M> {
             clients: Arc::clone(&self.clients),
             next_client_id: Arc::clone(&self.next_client_id),
             timers: Arc::clone(&self.timers),
+            cancellations: Arc::clone(&self.cancellations),
             next_id: Arc::clone(&self.next_id),
 
             thread: Arc::clone(&self.thread),
@@ -101,7 +114,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
                     let (time, cancelled) = {
                         let timers = timers.lock().unwrap();
                         let (timer, time) = timers.peek().unwrap();
-                        ((*time).into(), timer.cancelled)
+                        ((*time).into(), timer.cancelled.load(AtOrdering::SeqCst))
                     };
 
                     if cancelled {
@@ -129,6 +142,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
             clients,
             next_client_id: Arc::new(AtomicUsize::new(0)),
             timers,
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicUsize::new(0)),
 
             thread,
@@ -147,22 +161,24 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
     }
     pub fn post_message(&self, client: TimerManagerClient, message: M, when: Instant) -> Timer {
         let id = self.next_id.fetch_add(1, AtOrdering::Relaxed);
-        self.timers.lock().unwrap().push(TimerInfo::new(id, client.0, message), when.into());
+        let info = TimerInfo::new(id, client.0, message);
+
+        self.cancellations.lock().unwrap().insert(id, Arc::clone(&info.cancelled));
+        self.timers.lock().unwrap().push(info, when.into());
+
         self.wakeup_tx.send(()).unwrap();
         Timer(id)
     }
     pub fn cancel_message(&self, timer: Timer) -> bool {
         let found = {
-            let mut found = false;
-            let mut timers = self.timers.lock().unwrap();
-            for (info, _) in timers.iter_mut() {
-                if info.id == timer.0 {
-                    info.cancelled = true;
-                    found = true;
-                }
+            let mut cancellations = self.cancellations.lock().unwrap();
+            match cancellations.remove(&timer.0) {
+                Some(cancellation) => {
+                    cancellation.store(true, AtOrdering::SeqCst);
+                    true
+                },
+                None => false
             }
-
-            found
         };
 
         if !found {
