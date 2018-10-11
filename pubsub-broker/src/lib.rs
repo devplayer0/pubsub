@@ -11,18 +11,19 @@ use std::net::{SocketAddr, UdpSocket};
 extern crate quick_error;
 #[macro_use]
 extern crate log;
-extern crate ctrlc;
+extern crate bytes;
 extern crate num_cpus;
 #[macro_use]
-extern crate crossbeam;
+extern crate crossbeam_channel;
 
 extern crate pubsub_common as common;
 
-use crossbeam::channel::{self, Sender, Receiver};
-use crossbeam::queue::MsQueue;
+use bytes::{BufMut, Bytes, BytesMut};
+use crossbeam_channel as channel;
+use crossbeam_channel::{Sender, Receiver};
 
 use common::timer::TimerManager;
-use common::{Data, GbnTimeout};
+use common::GbnTimeout;
 
 pub mod config;
 mod client;
@@ -30,6 +31,14 @@ mod worker;
 
 use client::Client;
 use worker::{Worker, WorkerMessage};
+
+const BUFFER_PREALLOC_SIZE: usize = 1024 * common::IPV6_MAX_PACKET_SIZE;
+#[inline]
+fn check_alloc(buffer: &mut BytesMut) {
+    if buffer.capacity() < common::IPV6_MAX_PACKET_SIZE {
+        buffer.reserve(BUFFER_PREALLOC_SIZE);
+    }
+}
 
 quick_error! {
     #[derive(Debug)]
@@ -57,7 +66,7 @@ quick_error! {
 struct WorkerManager {
     timers: TimerManager<GbnTimeout>,
     sockets: HashMap<SocketAddr, UdpSocket>,
-    buffers: Arc<MsQueue<Vec<u8>>>,
+    buffer: BytesMut,
 
     use_heartbeats: bool,
     next_worker: AtomicUsize,
@@ -67,19 +76,19 @@ struct WorkerManager {
     disconnect_rx: Receiver<WorkerMessage>,
 }
 impl WorkerManager {
-    pub fn new(sockets: Vec<UdpSocket>, buffers: Arc<MsQueue<Vec<u8>>>, use_heartbeats: bool) -> WorkerManager {
+    pub fn new(sockets: Vec<UdpSocket>, buffer: &BytesMut, use_heartbeats: bool) -> WorkerManager {
         let timers = TimerManager::new();
         let mut workers = Vec::with_capacity(num_cpus::get());
         let (disconnect_tx, disconnect_rx) = channel::unbounded();
         info!("creating {} workers...", workers.capacity());
         for _ in 0..workers.capacity() {
-            workers.push(Worker::new(&timers, Arc::clone(&buffers), disconnect_tx.clone()));
+            workers.push(Worker::new(&timers, disconnect_tx.clone()));
         }
 
         WorkerManager {
             timers,
             sockets: sockets.into_iter().map(|s| (s.local_addr().unwrap(), s)).collect(),
-            buffers,
+            buffer: buffer.clone(),
 
             use_heartbeats,
             workers,
@@ -98,7 +107,7 @@ impl WorkerManager {
 
         worker
     }
-    pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Data) {
+    pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Bytes) {
         while !self.disconnect_rx.is_empty() {
             match self.disconnect_rx.recv().unwrap() {
                 WorkerMessage::Disconnect(client) => { self.client_assignments.remove(&client).unwrap(); },
@@ -110,7 +119,7 @@ impl WorkerManager {
             let tx = {
                 let worker = self.next_worker();
                 let (tx, timeout_tx) = worker.tx();
-                let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), Arc::clone(&self.buffers), &timeout_tx, self.use_heartbeats);
+                let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buffer, &timeout_tx, self.use_heartbeats);
                 worker.assign(client);
                 tx
             };
@@ -138,55 +147,56 @@ impl Broker {
     pub fn bind<'a, I>(addrs: I, use_heartbeats: bool) -> Result<Broker, Error>
     where I: IntoIterator<Item = &'a SocketAddr>
     {
-        let buffers = Arc::new(MsQueue::new());
-        for _ in 0..1024 {
-            buffers.push(vec![0; common::IPV6_MAX_PACKET_SIZE]);
-        }
+        let buffer = BytesMut::with_capacity(BUFFER_PREALLOC_SIZE);
 
         let mut sockets = Vec::new();
         for addr in addrs {
             info!("binding on {}...", addr);
 
             let socket = UdpSocket::bind(addr)?;
-            socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+            socket.set_read_timeout(Some(Duration::from_millis(500)))?;
             sockets.push(socket);
         }
 
         let clients = Arc::new(Mutex::new(WorkerManager::new(
                     sockets.iter().map(|s| s.try_clone().unwrap()).collect(),
-                    Arc::clone(&buffers),
+                    &buffer,
                     use_heartbeats)));
         let running = Arc::new(AtomicBool::new(true));
         let mut io_threads = Vec::new();
         for socket in sockets {
             let addr = socket.local_addr().unwrap();
+            let max_size = match addr {
+                SocketAddr::V4(_) => common::IPV4_MAX_PACKET_SIZE,
+                SocketAddr::V6(_) => common::IPV6_MAX_PACKET_SIZE,
+            };
 
             let running = Arc::clone(&running);
-            let buffers = Arc::clone(&buffers);
+            let mut buffer = buffer.clone();
             let clients = Arc::clone(&clients);
             io_threads.push(thread::spawn(move || {
                 while running.load(Ordering::SeqCst) {
-                    let mut buffer = buffers.pop();
-                    let (size, src) = match socket.recv_from(&mut buffer) {
-                        Ok((size, src)) => (size, src),
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            buffers.push(buffer);
-                            continue;
-                        },
-                        Err(e) => {
-                            error!("error while receiving udp packet: {}", e);
-                            continue;
-                        }
-                    };
-                    if size > match addr {
-                        SocketAddr::V4(_) => common::IPV4_MAX_PACKET_SIZE,
-                        SocketAddr::V6(_) => common::IPV6_MAX_PACKET_SIZE
-                    } {
-                        buffers.push(buffer);
-                        continue;
-                    }
+                    check_alloc(&mut buffer);
+                    let mut packet_buffer = buffer.split_to(max_size);
 
-                    clients.lock().unwrap().dispatch(addr, src, Data::from_buffer(buffer, size));
+                    let (size, src) = unsafe {
+                        let (size, src) = match socket.recv_from(packet_buffer.bytes_mut()) {
+                            Ok((size, src)) => (size, src),
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                buffer.unsplit(packet_buffer);
+                                continue
+                            },
+                            Err(e) => {
+                                error!("error while receiving udp packet: {}", e);
+                                continue;
+                            }
+                        };
+                        packet_buffer.advance_mut(size);
+                        (size, src)
+                    };
+
+                    packet_buffer.truncate(size);
+                    clients.lock().unwrap().dispatch(addr, src, packet_buffer.freeze());
                 }
             }));
         }

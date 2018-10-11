@@ -93,7 +93,7 @@ fn valid_conn_packet() {
 }
 #[test]
 fn encode_conn_packet() {
-    let connect = Packet::make_connect(vec![0; 5]);
+    let connect = Packet::make_connect(&mut BytesMut::with_capacity(5));
     assert!(Packet::validate_connect(&connect).is_ok());
 }
 
@@ -141,6 +141,6 @@ fn decode_subscribe() {
 }
 #[test]
 fn encode_subscribe() {
-    let topic = Packet::make_subscribe(vec![0; 11], "memes 🤔", 0);
+    let topic = Packet::make_subscribe(&mut BytesMut::with_capacity(11), "memes 🤔", 0);
     assert!(test_gbn().decode(&topic).is_ok());
 }

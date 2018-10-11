@@ -5,6 +5,7 @@ use std::process;
 #[macro_use]
 extern crate log;
 extern crate simplelog;
+extern crate ctrlc;
 
 extern crate pubsub_broker;
 
@@ -33,7 +34,7 @@ fn run(config: Config) -> Result<(), Box<dyn StdError>> {
         })?;
     }
 
-    let broker = Broker::bind(config.bind_addrs(), true)?;
+    let broker = Broker::bind(config.bind_addrs(), false)?;
 
     let &(ref stop_lock, ref stop_cond) = &*stop;
     let mut stop = stop_lock.lock().unwrap();

@@ -1,18 +1,17 @@
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::net::{SocketAddr, UdpSocket};
 
-use crossbeam::queue::MsQueue;
-use crossbeam::channel::Sender;
+use bytes::BytesMut;
+use crossbeam_channel::Sender;
 
 use common::timer::TimerManager;
 use common::{Packet, GoBackN, GbnTimeout};
-use ::Error;
+use ::{Error, check_alloc};
 
 #[derive(Debug)]
 pub struct Client {
     addr: SocketAddr,
-    buffers: Arc<MsQueue<Vec<u8>>>,
+    buffer: BytesMut,
     gbn: GoBackN,
 
     pub connected: bool,
@@ -28,10 +27,10 @@ impl PartialEq for Client {
     }
 }
 impl Client {
-    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buffers: Arc<MsQueue<Vec<u8>>>, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> Client {
+    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buffer: &BytesMut, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> Client {
         Client {
             addr,
-            buffers,
+            buffer: buffer.clone(),
             gbn: GoBackN::new(timers, addr, socket, timeout_tx, use_heartbeats),
 
             connected: false,
@@ -44,21 +43,19 @@ impl Client {
         &mut self.gbn
     }
 
-    pub fn send_heartbeat(&self) -> Result<(), Error> {
-        self.buffers.push(self.gbn.send_heartbeat(self.addr, self.buffers.pop())?);
+    pub fn send_heartbeat(&mut self) -> Result<(), Error> {
+        check_alloc(&mut self.buffer);
+        self.gbn.send_heartbeat(self.addr, &mut self.buffer)?;
         Ok(())
     }
-    pub fn send_disconnect(&self) -> Result<(), Error> {
-        self.buffers.push(self.gbn.send_disconnect(self.addr, self.buffers.pop())?);
+    pub fn send_disconnect(&mut self) -> Result<(), Error> {
+        check_alloc(&mut self.buffer);
+        self.gbn.send_disconnect(self.addr, &mut self.buffer)?;
         Ok(())
     }
     pub fn handle(&mut self, packet: Packet) -> Result<(), Error> {
         match packet {
-            Packet::Ack(seq) => {
-                for buffer in self.gbn.handle_ack(seq) {
-                    self.buffers.push(buffer.take());
-                }
-            },
+            Packet::Ack(seq) => self.gbn.handle_ack(seq),
             Packet::Heartbeat => {
                 // TODO: timeout
                 debug!("got heartbeat from {}", self.addr);

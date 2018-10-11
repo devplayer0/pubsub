@@ -3,17 +3,18 @@ use std::thread::{self, JoinHandle};
 use std::sync::{Arc, Mutex, RwLock};
 use std::net::SocketAddr;
 
-use crossbeam::queue::MsQueue;
-use crossbeam::channel::{self, Sender};
+use bytes::Bytes;
+use crossbeam_channel as channel;
+use crossbeam_channel::Sender;
 
-use ::common::{self, Data, Packet, GbnTimeout};
+use ::common::{self, Packet, GbnTimeout};
 use common::timer::TimerManager;
 use ::Error;
 use ::client::{Client};
 
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum WorkerMessage {
-    Packet(SocketAddr, Data),
+    Packet(SocketAddr, Bytes),
     Disconnect(SocketAddr),
     Shutdown,
 }
@@ -29,7 +30,7 @@ pub struct Worker {
     thread: JoinHandle<()>,
 }
 impl Worker {
-    pub fn new(timers: &TimerManager<GbnTimeout>, buffers: Arc<MsQueue<Vec<u8>>>, disconnect_tx: Sender<WorkerMessage>) -> Worker {
+    pub fn new(timers: &TimerManager<GbnTimeout>, disconnect_tx: Sender<WorkerMessage>) -> Worker {
         let clients: Arc<RwLock<HashMap<_, Mutex<Client>>>> = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = channel::unbounded();
         let (timeout_tx, timeout_rx) = channel::unbounded();
@@ -46,7 +47,7 @@ impl Worker {
                                         error!("client {} timed out, disconnecting...", src);
                                         let mut clients = clients.write().unwrap();
                                         {
-                                            let client = clients[&src].lock().unwrap();
+                                            let mut client = clients[&src].lock().unwrap();
                                             if let Err(e) = client.send_disconnect() {
                                                 warn!("error while sending disconnect packet to {}: {}", src, e);
                                             }
@@ -87,7 +88,6 @@ impl Worker {
                                                 }
                                             }
 
-                                            buffers.push(data.take());
                                             continue;
                                         }
 
@@ -131,7 +131,6 @@ impl Worker {
 
                                             Ok(false) => {},
                                         }
-                                        buffers.push(data.take());
                                     },
                                     WorkerMessage::Shutdown => running = false,
                                     _ => panic!("impossible"),

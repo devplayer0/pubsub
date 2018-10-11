@@ -1,13 +1,11 @@
 #![feature(euclidean_division)]
 
-use std::ops::Deref;
 use std::cmp;
-use std::hash::{Hash, Hasher};
 use std::fmt::{self, Display};
 use std::string::FromUtf8Error;
 use std::collections::LinkedList;
 use std::time::{Duration, Instant};
-use std::io::{self, Write, Cursor};
+use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
 #[macro_use]
@@ -16,11 +14,12 @@ extern crate quick_error;
 extern crate log;
 #[macro_use]
 extern crate enum_primitive;
-extern crate byteorder;
+extern crate bytes;
 extern crate crossbeam_channel;
 extern crate priority_queue;
 
 use enum_primitive::FromPrimitive;
+use bytes::{IntoBuf, Buf, BufMut, Bytes, BytesMut};
 use crossbeam_channel::Sender;
 
 pub mod timer;
@@ -94,53 +93,6 @@ quick_error! {
     }
 }
 
-#[derive(Eq, Debug)]
-pub struct Data {
-    buffer: Vec<u8>,
-    size: usize,
-}
-impl Data {
-    pub fn from_buffer(buffer: Vec<u8>, size: usize) -> Data {
-        Data {
-            buffer,
-            size,
-        }
-    }
-    pub fn take(self) -> Vec<u8> {
-        self.buffer
-    }
-    pub fn cursor(&mut self) -> Cursor<&mut [u8]> {
-        Cursor::new(&mut self.buffer[..self.size])
-    }
-}
-impl Deref for Data {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        &self.buffer[..self.size]
-    }
-}
-impl From<Vec<u8>> for Data {
-    fn from(buf: Vec<u8>) -> Self {
-        let size = buf.len();
-        Data::from_buffer(buf, size)
-    }
-}
-impl Clone for Data {
-    fn clone(&self) -> Self {
-        Data::from_buffer(self.buffer.clone(), self.size)
-    }
-}
-impl PartialEq for Data {
-    fn eq(&self, other: &Data) -> bool {
-        self.buffer == other.buffer
-    }
-}
-impl Hash for Data {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.buffer.hash(state);
-    }
-}
-
 enum_from_primitive! {
     #[derive(Debug, PartialEq)]
     pub enum PacketType {
@@ -173,7 +125,7 @@ pub enum Packet {
     Subscribe(String),
 }
 impl Packet {
-    pub fn validate_connect(buffer: &Data) -> Result<Packet, DecodeError> {
+    pub fn validate_connect(buffer: &Bytes) -> Result<Packet, DecodeError> {
         if buffer.len() != 1 + CONNECT_MAGIC.len() || 
             PacketType::from_u8(buffer[0]) != Some(PacketType::Connect) || 
             &buffer[1..] != CONNECT_MAGIC {
@@ -183,29 +135,31 @@ impl Packet {
         Ok(Packet::Connect)
     }
 
-    pub fn make_connect(buffer: Vec<u8>) -> Data {
-        let mut buffer = Data::from_buffer(buffer, 1 + CONNECT_MAGIC.len());
-        {
-            let mut cursor = buffer.cursor();
-            cursor.write(&[0]).unwrap();
-            cursor.write(&CONNECT_MAGIC).unwrap();
-        }
-        buffer
+    fn encode_header(packet_type: PacketType, seq: u8) -> u8 {
+        ((packet_type as u8) << SEQ_BITS) | seq
     }
-    pub fn make_heartbeat(mut buffer: Vec<u8>) -> Data {
-        buffer[0] = (PacketType::Heartbeat as u8) << SEQ_BITS;
-        Data::from_buffer(buffer, 1)
+    pub fn make_connect(buffer: &mut BytesMut) -> Bytes {
+        let mut data = buffer.split_to(1 + CONNECT_MAGIC.len());
+        data.put_u8(Packet::encode_header(PacketType::Connect, 0));
+        data.put_slice(CONNECT_MAGIC);
+        data.freeze()
     }
-    pub fn make_disconnect(mut buffer: Vec<u8>) -> Data {
-        buffer[0] = (PacketType::Disconnect as u8) << SEQ_BITS;
-        Data::from_buffer(buffer, 1)
+    fn make_heartbeat(buffer: &mut BytesMut) -> Bytes {
+        let mut data = buffer.split_to(1);
+        data.put_u8(Packet::encode_header(PacketType::Heartbeat, 0));
+        data.freeze()
     }
-    pub fn make_subscribe(buffer: Vec<u8>, topic: &str, seq: u8) -> Data {
-        let mut cursor = Cursor::new(buffer);
-        cursor.write(&[(PacketType::Subscribe as u8) << SEQ_BITS | seq]).unwrap();
-        cursor.write(topic.as_bytes()).unwrap();
-        let size = cursor.position() as usize;
-        Data::from_buffer(cursor.into_inner(), size)
+    fn make_disconnect(buffer: &mut BytesMut) -> Bytes {
+        let mut data = buffer.split_to(1);
+        data.put_u8(Packet::encode_header(PacketType::Disconnect, 0));
+        data.freeze()
+    }
+    fn make_subscribe(buffer: &mut BytesMut, topic: &str, seq: u8) -> Bytes {
+        let topic = topic.as_bytes();
+        let mut data = buffer.split_to(1 + topic.len());
+        data.put_u8(Packet::encode_header(PacketType::Subscribe, seq));
+        data.put_slice(topic);
+        data.freeze()
     }
 }
 
@@ -222,7 +176,7 @@ pub struct GoBackN {
     timers_client: TimerManagerClient,
     heartbeat_timeout: Option<Timer>,
 
-    send_buffer: LinkedList<Data>,
+    send_buffer: LinkedList<Bytes>,
     send_buffer_sseq: u8,
     send_seq: u8,
 
@@ -231,7 +185,7 @@ pub struct GoBackN {
 impl Drop for GoBackN {
     fn drop(&mut self) {
         if let Some(timer) = self.heartbeat_timeout {
-            self.timers.cancel_message(timer);
+            assert!(self.timers.cancel_message(timer));
         }
         self.timers.unregister(self.timers_client);
     }
@@ -259,18 +213,17 @@ impl GoBackN {
         }
     }
 
-    pub fn handle_ack(&mut self, seq: u8) -> LinkedList<Data> {
+    pub fn handle_ack(&mut self, seq: u8) {
         if !seq_in_window(self.send_buffer_sseq, seq) || slide_amount(self.send_buffer_sseq, seq) as usize > self.send_buffer.len() {
             warn!("received ack from {} outside of window", self.addr);
-            return LinkedList::new();
+            return;
         }
 
         let buffer_size = self.send_buffer.len();
-        let acknowledged = self.send_buffer.split_off(cmp::min(slide_amount(self.send_buffer_sseq, seq) as usize, buffer_size));
+        self.send_buffer.split_off(cmp::min(slide_amount(self.send_buffer_sseq, seq) as usize, buffer_size));
 
         self.send_buffer_sseq = next_seq(seq);
         self.send_seq = self.send_buffer_sseq;
-        acknowledged
     }
     fn recv_slide(&mut self, seq: u8) -> Result<(), DecodeError> {
         if seq != self.recv_seq {
@@ -281,21 +234,22 @@ impl GoBackN {
         self.recv_seq = next_seq(seq);
         Ok(())
     }
-    pub fn decode(&mut self, buffer: &Data) -> Result<Packet, DecodeError> {
+    pub fn decode(&mut self, data: &Bytes) -> Result<Packet, DecodeError> {
         use DecodeError::*;
         use PacketType::*;
 
-        if buffer.len() == 0 {
+        let mut data = data.into_buf();
+        if data.remaining() == 0 {
             return Err(InvalidHeader);
         }
-        let header = buffer[0];
+        let header = data.get_u8();
         let t = header >> SEQ_BITS;
         if let Some(t) = PacketType::from_u8(t) {
             let seq = header & (0xff >> (8-SEQ_BITS));
             return match t {
                 Connect => Err(AlreadyConnected),
-                Heartbeat => match buffer.len() {
-                    1 if seq == 0 => {
+                Heartbeat => match data.remaining() {
+                    0 if seq == 0 => {
                         if let Some(timer) = self.heartbeat_timeout {
                             self.timers.cancel_message(timer);
                             self.heartbeat_timeout = Some(self.timers.post_message(self.timers_client, GbnTimeout::Heartbeat(self.addr), Instant::now() + HEARTBEAT_TIMEOUT));
@@ -305,17 +259,17 @@ impl GoBackN {
                     },
                     _ => Err(Malformed(Heartbeat)),
                 },
-                Ack => match buffer.len() {
-                     1 => Ok(Packet::Ack(seq)),
+                Ack => match data.remaining() {
+                     0 => Ok(Packet::Ack(seq)),
                      _ => Err(Malformed(Ack)),
                 },
-                Disconnect => match buffer.len() {
-                    1 if seq == 0 => Ok(Packet::Disconnect),
+                Disconnect => match data.remaining() {
+                    0 if seq == 0 => Ok(Packet::Disconnect),
                     _ => Err(Malformed(Disconnect)),
                 },
-                Subscribe => if buffer.len() > 1 {
+                Subscribe => if data.remaining() > 0 {
                     self.recv_slide(seq)?;
-                    Ok(Packet::Subscribe(String::from_utf8(buffer[1..].into())?))
+                    Ok(Packet::Subscribe(String::from_utf8(data.collect())?))
                 } else {
                     Err(Malformed(Subscribe))
                 },
@@ -325,15 +279,15 @@ impl GoBackN {
         }
     }
 
-    pub fn send_heartbeat(&self, addr: SocketAddr, buffer: Vec<u8>) -> Result<Vec<u8>, io::Error> {
+    pub fn send_heartbeat(&self, addr: SocketAddr, buffer: &mut BytesMut) -> Result<(), io::Error> {
         let heartbeat = Packet::make_heartbeat(buffer);
         self.socket.send_to(&heartbeat, addr)?;
-        Ok(heartbeat.take())
+        Ok(())
     }
-    pub fn send_disconnect(&self, addr: SocketAddr, buffer: Vec<u8>) -> Result<Vec<u8>, io::Error> {
+    pub fn send_disconnect(&self, addr: SocketAddr, buffer: &mut BytesMut) -> Result<(), io::Error> {
         let disconnect = Packet::make_disconnect(buffer);
         self.socket.send_to(&disconnect, addr)?;
-        Ok(disconnect.take())
+        Ok(())
     }
 }
 

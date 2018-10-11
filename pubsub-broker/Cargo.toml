@@ -7,7 +7,8 @@ authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
 quick-error = "~1.2"
 log = "~0.4"
 simplelog = "~0.5"
-ctrlc = { version = "~3.0", features = [ "termination" ] }
+bytes = "~0.4"
 num_cpus = "~1.8"
-crossbeam = "~0.4"
+crossbeam-channel = "~0.2"
+ctrlc = { version = "~3.0", features = [ "termination" ] }
 pubsub-common = { path = "../pubsub-common" }
