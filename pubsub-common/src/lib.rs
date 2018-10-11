@@ -138,20 +138,10 @@ impl Packet {
     fn encode_header(packet_type: PacketType, seq: u8) -> u8 {
         ((packet_type as u8) << SEQ_BITS) | seq
     }
-    pub fn make_connect(buffer: &mut BytesMut) -> Bytes {
-        let mut data = buffer.split_to(1 + CONNECT_MAGIC.len());
+    pub fn make_connect() -> Bytes {
+        let mut data = BytesMut::with_capacity(1 + CONNECT_MAGIC.len());
         data.put_u8(Packet::encode_header(PacketType::Connect, 0));
         data.put_slice(CONNECT_MAGIC);
-        data.freeze()
-    }
-    fn make_heartbeat(buffer: &mut BytesMut) -> Bytes {
-        let mut data = buffer.split_to(1);
-        data.put_u8(Packet::encode_header(PacketType::Heartbeat, 0));
-        data.freeze()
-    }
-    fn make_disconnect(buffer: &mut BytesMut) -> Bytes {
-        let mut data = buffer.split_to(1);
-        data.put_u8(Packet::encode_header(PacketType::Disconnect, 0));
         data.freeze()
     }
     fn make_subscribe(buffer: &mut BytesMut, topic: &str, seq: u8) -> Bytes {
@@ -230,7 +220,7 @@ impl GoBackN {
             return Err(DecodeError::OutOfOrder(self.recv_seq, seq));
         }
 
-        self.socket.send_to(&[(PacketType::Ack as u8) << SEQ_BITS | seq], self.addr)?;
+        self.socket.send_to(&[Packet::encode_header(PacketType::Ack, seq)], self.addr)?;
         self.recv_seq = next_seq(seq);
         Ok(())
     }
@@ -279,14 +269,12 @@ impl GoBackN {
         }
     }
 
-    pub fn send_heartbeat(&self, addr: SocketAddr, buffer: &mut BytesMut) -> Result<(), io::Error> {
-        let heartbeat = Packet::make_heartbeat(buffer);
-        self.socket.send_to(&heartbeat, addr)?;
+    pub fn send_heartbeat(&self, addr: SocketAddr) -> Result<(), io::Error> {
+        self.socket.send_to(&[Packet::encode_header(PacketType::Heartbeat, 0)], addr)?;
         Ok(())
     }
-    pub fn send_disconnect(&self, addr: SocketAddr, buffer: &mut BytesMut) -> Result<(), io::Error> {
-        let disconnect = Packet::make_disconnect(buffer);
-        self.socket.send_to(&disconnect, addr)?;
+    pub fn send_disconnect(&self, addr: SocketAddr) -> Result<(), io::Error> {
+        self.socket.send_to(&[Packet::encode_header(PacketType::Disconnect, 0)], addr)?;
         Ok(())
     }
 }

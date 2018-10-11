@@ -6,7 +6,7 @@ use crossbeam_channel::Sender;
 
 use common::timer::TimerManager;
 use common::{Packet, GoBackN, GbnTimeout};
-use ::{Error, check_alloc};
+use ::Error;
 
 #[derive(Debug)]
 pub struct Client {
@@ -43,14 +43,12 @@ impl Client {
         &mut self.gbn
     }
 
-    pub fn send_heartbeat(&mut self) -> Result<(), Error> {
-        check_alloc(&mut self.buffer);
-        self.gbn.send_heartbeat(self.addr, &mut self.buffer)?;
+    pub fn send_heartbeat(&self) -> Result<(), Error> {
+        self.gbn.send_heartbeat(self.addr)?;
         Ok(())
     }
-    pub fn send_disconnect(&mut self) -> Result<(), Error> {
-        check_alloc(&mut self.buffer);
-        self.gbn.send_disconnect(self.addr, &mut self.buffer)?;
+    pub fn send_disconnect(&self) -> Result<(), Error> {
+        self.gbn.send_disconnect(self.addr)?;
         Ok(())
     }
     pub fn handle(&mut self, packet: Packet) -> Result<(), Error> {

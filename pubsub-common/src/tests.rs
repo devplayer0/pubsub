@@ -93,7 +93,7 @@ fn valid_conn_packet() {
 }
 #[test]
 fn encode_conn_packet() {
-    let connect = Packet::make_connect(&mut BytesMut::with_capacity(5));
+    let connect = Packet::make_connect();
     assert!(Packet::validate_connect(&connect).is_ok());
 }
 
