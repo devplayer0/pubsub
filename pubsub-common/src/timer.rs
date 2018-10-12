@@ -71,7 +71,7 @@ pub struct TimerManager<M: Send + Eq + Hash + 'static> {
     clients: Arc<RwLock<HashMap<usize, Sender<M>>>>,
     next_client_id: Arc<AtomicUsize>,
     timers: Arc<Mutex<PriorityQueue<TimerInfo<M>, ReverseInstant>>>,
-    cancellations: Arc<Mutex<HashMap<usize, Arc<AtomicBool>>>>,
+    timers_map: Arc<RwLock<HashMap<usize, Arc<AtomicBool>>>>,
     next_id: Arc<AtomicUsize>,
 
     thread: Arc<JoinHandle<()>>,
@@ -84,7 +84,7 @@ impl<M: Send + Eq + Hash + 'static> Clone for TimerManager<M> {
             clients: Arc::clone(&self.clients),
             next_client_id: Arc::clone(&self.next_client_id),
             timers: Arc::clone(&self.timers),
-            cancellations: Arc::clone(&self.cancellations),
+            timers_map: Arc::clone(&self.timers_map),
             next_id: Arc::clone(&self.next_id),
 
             thread: Arc::clone(&self.thread),
@@ -98,11 +98,13 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         let running = Arc::new(Mutex::new(true));
         let clients: Arc<RwLock<HashMap<_, Sender<M>>>> = Arc::new(RwLock::new(HashMap::new()));
         let timers: Arc<Mutex<PriorityQueue<TimerInfo<M>, ReverseInstant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
+        let timers_map = Arc::new(RwLock::new(HashMap::new()));
         let (wakeup_tx, wakeup_rx) = mpsc::sync_channel(0);
         let thread = Arc::new({
             let running_lock = Arc::clone(&running);
             let clients = Arc::clone(&clients);
             let timers = Arc::clone(&timers);
+            let timers_map = Arc::clone(&timers_map);
             thread::spawn(move || {
                 while *running_lock.lock().unwrap() {
                     if timers.lock().unwrap().is_empty() {
@@ -123,11 +125,13 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
                     }
                     if Instant::now() > time {
                         let (timer, _) = timers.lock().unwrap().pop().unwrap();
+                        timers_map.write().unwrap().remove(&timer.id);
                         clients.read().unwrap()[&timer.client].send(timer.message);
                     } else {
                         match wakeup_rx.recv_timeout(time - Instant::now()) {
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 let (timer, _) = timers.lock().unwrap().pop().unwrap();
+                                timers_map.write().unwrap().remove(&timer.id);
                                 clients.read().unwrap()[&timer.client].send(timer.message);
                             },
                             Ok(_) => {},
@@ -142,7 +146,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
             clients,
             next_client_id: Arc::new(AtomicUsize::new(0)),
             timers,
-            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            timers_map,
             next_id: Arc::new(AtomicUsize::new(0)),
 
             thread,
@@ -163,15 +167,19 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         let id = self.next_id.fetch_add(1, AtOrdering::Relaxed);
         let info = TimerInfo::new(id, client.0, message);
 
-        self.cancellations.lock().unwrap().insert(id, Arc::clone(&info.cancelled));
+        self.timers_map.write().unwrap().insert(id, Arc::clone(&info.cancelled));
         self.timers.lock().unwrap().push(info, when.into());
 
         self.wakeup_tx.send(()).unwrap();
         Timer(id)
     }
+    pub fn expired(&self, timer: Timer) -> bool {
+        let cancellations = self.timers_map.read().unwrap();
+        !cancellations.contains_key(&timer.0)
+    }
     pub fn cancel_message(&self, timer: Timer) -> bool {
         let found = {
-            let mut cancellations = self.cancellations.lock().unwrap();
+            let mut cancellations = self.timers_map.write().unwrap();
             match cancellations.remove(&timer.0) {
                 Some(cancellation) => {
                     cancellation.store(true, AtOrdering::SeqCst);

@@ -1,12 +1,12 @@
 #![feature(euclidean_division)]
 
 use std::cmp;
+use std::mem::{self, size_of};
 use std::str::{self, Utf8Error};
 use std::fmt::{self, Display};
 use std::collections::LinkedList;
 use std::time::{Duration, Instant};
-use std::mem;
-use std::io;
+use std::io::{self, Read};
 use std::net::{SocketAddr, UdpSocket};
 
 #[macro_use]
@@ -25,7 +25,9 @@ use enum_primitive::FromPrimitive;
 use bytes::{IntoBuf, Buf, BufMut, Bytes, BytesMut};
 use crossbeam_channel::Sender;
 
+pub mod util;
 pub mod timer;
+use util::BufferProvider;
 use timer::{TimerManager, TimerManagerClient, Timer};
 
 pub const IPV4_MAX_PACKET_SIZE: usize = 508;
@@ -34,7 +36,9 @@ pub const IPV6_MAX_PACKET_SIZE: usize = 1212;
 pub const SEQ_BITS: u8 = 3;
 pub const SEQ_RANGE: u8 = 8;
 pub const WINDOW_SIZE: u8 = SEQ_RANGE - 1;
+pub const SEND_BUFFER_SIZE: usize = 128;
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub const CONNECT_MAGIC: &'static [u8] = b"JQTT";
 pub const MAX_TOPIC_LENGTH: usize = IPV4_MAX_PACKET_SIZE - 1;
@@ -59,7 +63,7 @@ pub fn next_seq(seq: u8) -> u8 {
 
 quick_error! {
     #[derive(Debug)]
-    pub enum DecodeError {
+    pub enum GbnError {
         InvalidConnect {
             description("invalid connection packet")
         }
@@ -108,6 +112,9 @@ quick_error! {
             description("message is bigger than specified")
             display("message is {} bytes, specified as {}", actual, expected)
         }
+        MessageAlreadyQueued {
+            description("a message is already queued for publishing")
+        }
     }
 }
 
@@ -145,14 +152,14 @@ pub enum Packet<'a> {
     Ack(u8),
     Disconnect,
     Subscribe(&'a str),
-    Message(#[debug_stub = "Buf"] Box<Buf + Send>),
+    Message(#[debug_stub = "Buf"] Box<Buf + Send + 'a>),
 }
 impl<'a> Packet<'a> {
-    pub fn validate_connect(buffer: &Bytes) -> Result<Packet, DecodeError> {
+    pub fn validate_connect(buffer: &Bytes) -> Result<Packet, GbnError> {
         if buffer.len() != 1 + CONNECT_MAGIC.len() || 
             PacketType::from_u8(buffer[0]) != Some(PacketType::Connect) || 
             &buffer[1..] != CONNECT_MAGIC {
-            return Err(DecodeError::InvalidConnect);
+            return Err(GbnError::InvalidConnect);
         }
 
         Ok(Packet::Connect)
@@ -179,21 +186,22 @@ impl<'a> Packet<'a> {
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum GbnTimeout {
     Heartbeat(SocketAddr),
+    Ack(SocketAddr),
 }
 #[derive(DebugStub)]
-struct MessageBuffer {
+struct IncomingMessage {
     total_size: usize,
     size: usize,
     #[debug_stub = "Chain"]
     buffer: Box<Buf + Send>,
 }
-impl MessageBuffer {
-    fn new(total_size: usize, data: Bytes) -> Result<MessageBuffer, DecodeError> {
+impl IncomingMessage {
+    fn new(total_size: usize, data: Bytes) -> Result<IncomingMessage, GbnError> {
         if data.len() > total_size {
-            return Err(DecodeError::MessageTooBig(total_size, data.len()));
+            return Err(GbnError::MessageTooBig(total_size, data.len()));
         }
 
-        Ok(MessageBuffer {
+        Ok(IncomingMessage {
             total_size,
             size: data.len(),
             buffer: Box::new(data.into_buf()),
@@ -202,11 +210,11 @@ impl MessageBuffer {
     fn full(&self) -> bool {
         self.size == self.total_size
     }
-    fn append(&mut self, data: Bytes) -> Result<bool, DecodeError> {
+    fn append(&mut self, data: Bytes) -> Result<bool, GbnError> {
         let new_size = self.size + data.len();
         println!("new size: {}, total size: {}", new_size, self.total_size);
         if new_size > self.total_size {
-            return Err(DecodeError::MessageTooBig(self.total_size, new_size));
+            return Err(GbnError::MessageTooBig(self.total_size, new_size));
         }
 
         let buffer = mem::replace(&mut self.buffer, unsafe {
@@ -224,8 +232,57 @@ impl MessageBuffer {
     }
 }
 #[derive(Debug)]
+pub struct OutgoingMessage<I: Read + Send> {
+    reader: I,
+    size: u32,
+    read: u32,
+}
+impl<I: Read + Send> OutgoingMessage<I> {
+    pub fn new(input: I, size: u32) -> OutgoingMessage<I> {
+        OutgoingMessage {
+            reader: input,
+            size,
+            read: 0,
+        }
+    }
+    pub fn into_boxed<'a, R: Read + Send + 'a>(msg: OutgoingMessage<R>) -> OutgoingMessage<Box<Read + Send + 'a>> {
+        OutgoingMessage {
+            reader: Box::new(msg.reader),
+            size: msg.size,
+            read: msg.read,
+        }
+    }
+    pub fn next_packet(&mut self, mut data: BytesMut, seq: u8) -> Result<(bool, Option<Bytes>), io::Error> {
+        if self.read == self.size {
+            return Ok((true, None));
+        }
+
+        let header_size = if self.read == 0 {
+            data.put_u8(Packet::encode_header(PacketType::PublishStart, seq));
+            data.put_u32_be(self.size);
+            1 + size_of::<u32>()
+        } else {
+            data.put_u8(Packet::encode_header(PacketType::PublishData, seq));
+            1
+        };
+
+        let data_size = data.capacity() - header_size;
+        let to_read = cmp::min((self.size - self.read) as usize, data_size);
+        data.truncate(header_size + to_read);
+
+        unsafe {
+            self.reader.read_exact(&mut data.bytes_mut()[..to_read])?;
+            data.advance_mut(to_read);
+        }
+
+        self.read += to_read as u32;
+        Ok((self.read == self.size, Some(data.freeze())))
+    }
+}
+#[derive(DebugStub)]
 pub struct GoBackN {
     timers: TimerManager<GbnTimeout>,
+    buf_source: BufferProvider,
     addr: SocketAddr,
     socket: UdpSocket,
 
@@ -235,9 +292,12 @@ pub struct GoBackN {
     send_buffer: LinkedList<Bytes>,
     send_buffer_sseq: u8,
     send_seq: u8,
+    ack_timeout: Option<Timer>,
+    #[debug_stub = "OutgoingMessage"]
+    send_publish_buf: Option<OutgoingMessage<Box<Read + Send>>>,
 
     recv_seq: u8,
-    recv_publish_buf: Option<MessageBuffer>,
+    recv_publish_buf: Option<IncomingMessage>,
 }
 impl Drop for GoBackN {
     fn drop(&mut self) {
@@ -248,7 +308,7 @@ impl Drop for GoBackN {
     }
 }
 impl GoBackN {
-    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> GoBackN {
+    pub fn new(timers: &TimerManager<GbnTimeout>, buf_source: &BufferProvider, addr: SocketAddr, socket: UdpSocket, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> GoBackN {
         let timers_client = timers.register(&timeout_tx);
         let heartbeat_timeout = match use_heartbeats {
             true => Some(timers.post_message(timers_client, GbnTimeout::Heartbeat(addr), Instant::now() + HEARTBEAT_TIMEOUT)),
@@ -256,6 +316,7 @@ impl GoBackN {
         };
         GoBackN {
             timers: timers.clone(),
+            buf_source: buf_source.clone(),
             addr,
             socket,
 
@@ -265,12 +326,36 @@ impl GoBackN {
             send_buffer: LinkedList::new(),
             send_buffer_sseq: 0,
             send_seq: 0,
+            ack_timeout: None,
+            send_publish_buf: None,
 
             recv_seq: 0,
             recv_publish_buf: None,
         }
     }
 
+    fn max_packet_size(&self) -> usize {
+        match self.addr {
+            SocketAddr::V4(_) => IPV4_MAX_PACKET_SIZE,
+            SocketAddr::V6(_) => IPV6_MAX_PACKET_SIZE,
+        }
+    }
+    pub fn handle_ack_timeout(&mut self) -> Result<(), GbnError> {
+        self.check_ack_timeout();
+        {
+            let mut iter = self.send_buffer.iter();
+            for _ in 0..cmp::min(self.send_buffer.len(), WINDOW_SIZE as usize) {
+                self.socket.send_to(iter.next().unwrap(), self.addr)?;
+            }
+        }
+
+        Ok(())
+    }
+    fn check_ack_timeout(&mut self) {
+        if !self.send_buffer.is_empty() && (self.ack_timeout.is_none() || (self.ack_timeout.is_some() && self.timers.expired(self.ack_timeout.unwrap()))) {
+            self.ack_timeout = Some(self.timers.post_message(self.timers_client, GbnTimeout::Ack(self.addr), Instant::now() + ACK_TIMEOUT));
+        }
+    }
     pub fn handle_ack(&mut self, seq: u8) {
         if !seq_in_window(self.send_buffer_sseq, seq) || slide_amount(self.send_buffer_sseq, seq) as usize > self.send_buffer.len() {
             warn!("received ack from {} outside of window", self.addr);
@@ -282,18 +367,69 @@ impl GoBackN {
 
         self.send_buffer_sseq = next_seq(seq);
         self.send_seq = self.send_buffer_sseq;
+        if let Some(timer) = self.ack_timeout {
+            self.timers.cancel_message(timer);
+        }
+
+        self.check_ack_timeout();
     }
-    fn recv_slide(&mut self, seq: u8) -> Result<(), DecodeError> {
+    fn window_full(&self) -> bool {
+        self.send_buffer.len() >= WINDOW_SIZE as usize
+    }
+    fn send_now(&mut self, data: Bytes) -> Result<bool, GbnError> {
+        assert!(self.send_buffer.len() < WINDOW_SIZE as usize);
+        assert!(data.len() <= self.max_packet_size());
+
+        self.send_buffer.push_back(data);
+        self.socket.send_to(self.send_buffer.back().unwrap(), self.addr)?;
+        self.send_seq = next_seq(self.send_seq);
+        self.check_ack_timeout();
+        Ok(self.window_full())
+    }
+    pub fn drain_message(&mut self) -> Result<(), GbnError> {
+        let message = self.send_publish_buf.take();
+        match message {
+            None => Ok(()),
+            Some(mut msg) => {
+                let mut full = self.window_full();
+                while !full {
+                    let buf = self.buf_source.allocate(self.max_packet_size());
+                    let (finished, data) = msg.next_packet(buf, self.send_seq)?;
+                    if let Some(data) = data {
+                        full = self.send_now(data)?;
+                    }
+                    if finished {
+                        return Ok(())
+                    }
+                }
+
+                self.send_publish_buf = Some(msg);
+                Ok(())
+            },
+        }
+
+    }
+    pub fn queue_message<R: Read + Send + 'static>(&mut self, message: OutgoingMessage<R>) -> Result<(), GbnError> {
+        if let Some(_) = self.send_publish_buf {
+            return Err(GbnError::MessageAlreadyQueued);
+        }
+
+        self.send_publish_buf = Some(OutgoingMessage::<R>::into_boxed(message));
+        self.drain_message()?;
+        Ok(())
+    }
+
+    fn recv_slide(&mut self, seq: u8) -> Result<(), GbnError> {
         if seq != self.recv_seq {
-            return Err(DecodeError::OutOfOrder(self.recv_seq, seq));
+            return Err(GbnError::OutOfOrder(self.recv_seq, seq));
         }
 
         self.socket.send_to(&[Packet::encode_header(PacketType::Ack, seq)], self.addr)?;
         self.recv_seq = next_seq(seq);
         Ok(())
     }
-    pub fn decode<'a>(&mut self, data: &'a Bytes) -> Result<Packet<'a>, DecodeError> {
-        use DecodeError::*;
+    pub fn decode<'b>(&mut self, data: &'b Bytes) -> Result<Packet<'b>, GbnError> {
+        use GbnError::*;
         use PacketType::*;
 
         let mut data = data.into_buf();
@@ -338,7 +474,7 @@ impl GoBackN {
 
                         let msg_len = data.get_u32_be() as usize;
                         let pos = data.position() as usize;
-                        let msg_buf = MessageBuffer::new(msg_len, data.into_inner().slice_from(pos))?;
+                        let msg_buf = IncomingMessage::new(msg_len, data.into_inner().slice_from(pos))?;
 
                         match msg_buf.full() {
                             false => {
@@ -367,12 +503,12 @@ impl GoBackN {
         }
     }
 
-    pub fn send_heartbeat(&self, addr: SocketAddr) -> Result<(), io::Error> {
-        self.socket.send_to(&[Packet::encode_header(PacketType::Heartbeat, 0)], addr)?;
+    pub fn send_heartbeat(&self) -> Result<(), io::Error> {
+        self.socket.send_to(&[Packet::encode_header(PacketType::Heartbeat, 0)], self.addr)?;
         Ok(())
     }
-    pub fn send_disconnect(&self, addr: SocketAddr) -> Result<(), io::Error> {
-        self.socket.send_to(&[Packet::encode_header(PacketType::Disconnect, 0)], addr)?;
+    pub fn send_disconnect(&self) -> Result<(), io::Error> {
+        self.socket.send_to(&[Packet::encode_header(PacketType::Disconnect, 0)], self.addr)?;
         Ok(())
     }
 }

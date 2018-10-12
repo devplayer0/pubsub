@@ -1,5 +1,4 @@
 use super::*;
-use std::mem::size_of;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use std::thread;

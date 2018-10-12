@@ -3,14 +3,18 @@ packet_types = {
 	[1] = "HEARTBEAT",
 	[2] = "ACK",
 	[3] = "DISCONNECT",
-	[4] = "SUBSCRIBE"
+	[4] = "SUBSCRIBE",
+	[5] = "PUBLISH_START",
+	[6] = "PUBLISH_DATA",
 }
 
 jqtt_proto = Proto("JQTT", "Jack QTT")
 f_packet_type = ProtoField.uint8("jqtt.type", "Packet type", base.DEC, packet_types)
 f_packet_seq = ProtoField.uint8("jqtt.seq", "Sequence number", base.DEC)
 f_topic_name = ProtoField.string("jqtt.topic", "Topic name", base.UNICODE)
-jqtt_proto.fields = { f_packet_type, f_packet_seq, f_topic_name }
+f_message_size = ProtoField.uint32("jqtt.message_size", "Total message size", base.DEC)
+f_message_payload = ProtoField.bytes("jqtt.payload", "Partial message payload")
+jqtt_proto.fields = { f_packet_type, f_packet_seq, f_topic_name, f_message_size, f_message_payload }
 function jqtt_proto.dissector(buffer, pinfo, tree)
 	pinfo.cols.protocol = "JQTT"
 
@@ -37,6 +41,17 @@ function jqtt_proto.dissector(buffer, pinfo, tree)
 			subtree:add(f_packet_type, 4)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_topic_name, buffer(1, buffer:len() - 1))
+			return buffer:len()
+		elseif p_type == 5 and buffer:len() > 5 then
+			subtree:add(f_packet_type, 5)
+			subtree:add(f_packet_seq, seq)
+			subtree:add(f_message_size, buffer(1, 4))
+			subtree:add(f_message_payload, buffer(5, buffer:len() - 5))
+			return buffer:len()
+		elseif p_type == 6 and buffer:len() > 1 then
+			subtree:add(f_packet_type, 6)
+			subtree:add(f_packet_seq, seq)
+			subtree:add(f_message_payload, buffer(1, buffer:len() - 1))
 			return buffer:len()
 		end
 	end

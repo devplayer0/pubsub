@@ -55,7 +55,15 @@ impl Worker {
 
                                         clients.remove(&src);
                                         disconnect_tx.send(WorkerMessage::Disconnect(src));
-                                    }
+                                    },
+                                    GbnTimeout::Ack(src) => {
+                                        let clients = clients.read().unwrap();
+                                        let mut client = clients[&src].lock().unwrap();
+                                        warn!("client {} ack timed out, re-sending packets in window", src);
+                                        if let Err(e) = client.handle_ack_timeout() {
+                                            error!("error re-sending packets in window to {}: {}", src, e);
+                                        }
+                                    },
                                 }
                             }
                         },
@@ -93,15 +101,13 @@ impl Worker {
 
                                         let result = {
                                             let mut client = r_clients[&src].lock().unwrap();
-                                            let result = client.gbn().decode(&data);
+                                            let result = client.decode(&data);
                                             match result {
                                                 Ok(packet) => match packet {
-                                                    Packet::Disconnect => {
-                                                        Ok(true)
-                                                    },
+                                                    Packet::Disconnect => Ok(true),
                                                     _ => client.handle(packet).map(|_| false),
                                                 },
-                                                Err(e@common::DecodeError::OutOfOrder(_, _)) => {
+                                                Err(e@common::GbnError::OutOfOrder(_, _)) => {
                                                     warn!("{}", e);
                                                     Ok(false)
                                                 },
@@ -128,8 +134,9 @@ impl Worker {
                                                 },
                                                 _ => error!("error while processing packet from {}: {}", src, e)
                                             },
-
-                                            Ok(false) => {},
+                                            Ok(false) => if let Err(e) = r_clients[&src].lock().unwrap().drain_message() {
+                                                error!("error while encoding / sending message: {}", e);   
+                                            },
                                         }
                                     },
                                     WorkerMessage::Shutdown => running = false,

@@ -1,17 +1,17 @@
+use std::ops::{Deref, DerefMut};
 use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, UdpSocket};
 
-use bytes::BytesMut;
 use crossbeam_channel::Sender;
 
+use common::util::BufferProvider;
 use common::timer::TimerManager;
-use common::{Packet, GoBackN, GbnTimeout};
+use common::{Packet, GoBackN, GbnTimeout, OutgoingMessage};
 use ::Error;
 
 #[derive(Debug)]
 pub struct Client {
     addr: SocketAddr,
-    buffer: BytesMut,
     gbn: GoBackN,
 
     pub connected: bool,
@@ -26,12 +26,22 @@ impl PartialEq for Client {
         other.addr == self.addr
     }
 }
+impl Deref for Client {
+    type Target = GoBackN;
+    fn deref(&self) -> &Self::Target {
+        &self.gbn
+    }
+}
+impl DerefMut for Client {
+    fn deref_mut(&mut self) -> &mut GoBackN {
+        &mut self.gbn
+    }
+}
 impl Client {
-    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buffer: &BytesMut, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> Client {
+    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> Client {
         Client {
             addr,
-            buffer: buffer.clone(),
-            gbn: GoBackN::new(timers, addr, socket, timeout_tx, use_heartbeats),
+            gbn: GoBackN::new(timers, buf_source, addr, socket, timeout_tx, use_heartbeats),
 
             connected: false,
         }
@@ -39,27 +49,18 @@ impl Client {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
-    pub fn gbn(&mut self) -> &mut GoBackN {
-        &mut self.gbn
-    }
 
-    pub fn send_heartbeat(&self) -> Result<(), Error> {
-        self.gbn.send_heartbeat(self.addr)?;
-        Ok(())
-    }
-    pub fn send_disconnect(&self) -> Result<(), Error> {
-        self.gbn.send_disconnect(self.addr)?;
-        Ok(())
-    }
     pub fn handle(&mut self, packet: Packet) -> Result<(), Error> {
         match packet {
             Packet::Ack(seq) => self.gbn.handle_ack(seq),
-            Packet::Heartbeat => {
-                // TODO: timeout
-                debug!("got heartbeat from {}", self.addr);
-            },
+            Packet::Heartbeat => debug!("got heartbeat from {}", self.addr),
             Packet::Subscribe(topic) => {
-                info!("{} wants to subscribe to '{}'", self.addr, topic)
+                info!("{} wants to subscribe to '{}'", self.addr, topic);
+                if topic == "memes" {
+                    let lipsum = include_str!("lipsum.txt");
+                    let bytes = std::io::Cursor::new(lipsum.to_owned().into_bytes());
+                    self.gbn.queue_message(OutgoingMessage::new(bytes, lipsum.len() as u32))?;
+                }
             },
             _ => return Err(Error::InvalidPacketType)
         }
