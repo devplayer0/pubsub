@@ -46,7 +46,7 @@ function jqtt_proto.dissector(buffer, pinfo, tree)
 			subtree:add(f_packet_type, 5)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_message_size, buffer(1, 4))
-			subtree:add(f_message_payload, buffer(5, buffer:len() - 5))
+			subtree:add(f_topic_name, buffer(5, buffer:len() - 5))
 			return buffer:len()
 		elseif p_type == 6 and buffer:len() > 1 then
 			subtree:add(f_packet_type, 6)

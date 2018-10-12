@@ -13,6 +13,7 @@ use ::Error;
 pub struct Client {
     addr: SocketAddr,
     gbn: GoBackN,
+    buf_source: BufferProvider,
 
     pub connected: bool,
 }
@@ -42,6 +43,7 @@ impl Client {
         Client {
             addr,
             gbn: GoBackN::new(timers, buf_source, addr, socket, timeout_tx, use_heartbeats),
+            buf_source: buf_source.clone(),
 
             connected: false,
         }
@@ -59,7 +61,7 @@ impl Client {
                 if topic == "memes" {
                     let lipsum = include_str!("lipsum.txt");
                     let bytes = std::io::Cursor::new(lipsum.to_owned().into_bytes());
-                    self.gbn.queue_message(OutgoingMessage::new(bytes, lipsum.len() as u32))?;
+                    self.gbn.queue_message(OutgoingMessage::new(&self.buf_source, "memes", bytes, lipsum.len() as u32))?;
                 }
             },
             _ => return Err(Error::InvalidPacketType)

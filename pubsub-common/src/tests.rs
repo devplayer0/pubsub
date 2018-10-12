@@ -102,13 +102,13 @@ fn encode_conn_packet() {
 #[inline]
 fn test_gbn() -> GoBackN {
     let (tx, _) = channel::unbounded();
-    GoBackN::new(&TimerManager::new(), SocketAddr::from_str("127.0.0.1:1234").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), &tx, false)
+    GoBackN::new(&TimerManager::new(), &BufferProvider::new(IPV6_MAX_PACKET_SIZE, IPV6_MAX_PACKET_SIZE), SocketAddr::from_str("127.0.0.1:1234").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), &tx, false)
 }
 #[test]
 fn invalid_packet_type() {
     let packet = vec![(31 << SEQ_BITS)].into();
     assert!(match test_gbn().decode(&packet).unwrap_err() {
-        DecodeError::InvalidType(31) => true,
+        GbnError::InvalidType(31) => true,
         _ => false,
     })
 }
@@ -123,7 +123,7 @@ fn decode_ack() {
 
     let bad_ack = vec![(2 << SEQ_BITS) | 7, 123].into();
     assert!(match test_gbn().decode(&bad_ack).unwrap_err() {
-        DecodeError::Malformed(PacketType::Ack) => true,
+        GbnError::Malformed(PacketType::Ack) => true,
         _ => false,
     });
 }
@@ -153,16 +153,34 @@ fn encode_subscribe() {
 
 #[test]
 fn decode_short_message() {
+    let topic = "memes";
     let text = "it is wednesday my dudes";
-    let mut message = BytesMut::with_capacity(1 + size_of::<u32>() + text.len());
+    let mut publish_start = BytesMut::with_capacity(1 + size_of::<u32>() + topic.len());
 
     // packet type 5 (publish start), seq 0
-    message.put_u8((5 << SEQ_BITS) | 0);
-    message.put_u32_be(text.len() as u32);
-    message.put(text);
+    publish_start.put_u8((5 << SEQ_BITS) | 0);
+    publish_start.put_u32_be(text.len() as u32);
+    publish_start.put(topic);
 
-    assert!(match &test_gbn().decode(&message.freeze()) {
-        Ok(Packet::Message(data)) if str::from_utf8(data.bytes()).unwrap() == text => true,
+    let mut gbn = test_gbn();
+    assert!(match gbn.decode(&publish_start.freeze()) {
+        Err(GbnError::Partial(PacketType::PublishData)) => true,
+        Err(e) => {
+            println!("{}", e);
+            false
+        },
+        _ => false,
+    });
+
+    let mut publish_data = BytesMut::with_capacity(1 + size_of::<u32>() + text.len());
+
+    // packet type 6 (publish data), seq 1
+    publish_data.put_u8((6 << SEQ_BITS) | 1);
+    publish_data.put(text);
+    assert!(match gbn.decode(&publish_data.freeze()) {
+        Ok(Packet::Message(msg)) => {
+            String::from_utf8(msg.collect()).unwrap() == text
+        },
         Err(e) => {
             println!("{}", e);
             false
@@ -172,20 +190,24 @@ fn decode_short_message() {
 }
 #[test]
 fn decode_long_message() {
+    let topic = "memes";
     let mut packets = Vec::new();
+
+    {
+        let mut buffer = BytesMut::with_capacity(1 + size_of::<u32>() + topic.len());
+        // packet type 5 (publish start)
+        buffer.put_u8((5 << SEQ_BITS) | 0);
+        buffer.put_u32_be(LIPSUM.len() as u32);
+        buffer.put(topic);
+        packets.push(buffer.freeze());
+    }
+
     let mut i = 0;
-    let mut seq = 0;
+    let mut seq = 1;
     while i != LIPSUM.len() {
         // not the exact right amount but who cares...
-        let mut buffer = BytesMut::with_capacity(1 + size_of::<u32>() + IPV4_MAX_PACKET_SIZE);
-        if i == 0 {
-            // packet type 5 (publish start)
-            buffer.put_u8((5 << SEQ_BITS) | seq);
-            buffer.put_u32_be(LIPSUM.len() as u32);
-        } else {
-            // packet type 6 (publish data)
-            buffer.put_u8((6 << SEQ_BITS) | seq);
-        }
+        let mut buffer = BytesMut::with_capacity(1 + IPV4_MAX_PACKET_SIZE);
+        buffer.put_u8((6 << SEQ_BITS) | seq);
 
         let end = i + cmp::min(IPV4_MAX_PACKET_SIZE, LIPSUM.len() - i);
         buffer.put(&LIPSUM[i..end]);
@@ -200,7 +222,7 @@ fn decode_long_message() {
         let result = gbn.decode(packet);
         if i != packets.len() - 1 {
             assert!(match result {
-                Err(DecodeError::Partial(PacketType::PublishData)) => true,
+                Err(GbnError::Partial(PacketType::PublishData)) => true,
                 Err(e) => {
                     println!("{}", e);
                     false
@@ -209,10 +231,14 @@ fn decode_long_message() {
             });
         } else {
             assert!(match result {
-                Ok(Packet::Message(data)) => {
-                    let decoded = String::from_utf8(data.collect()).unwrap();
-                    println!("{}", decoded);
-                    decoded == LIPSUM
+                Ok(Packet::Message(msg)) => {
+                    if msg.topic() != topic {
+                        false
+                    } else {
+                        let decoded = String::from_utf8(msg.collect()).unwrap();
+                        println!("{}", decoded);
+                        decoded == LIPSUM
+                    }
                 },
                 Err(e) => {
                     println!("{}", e);

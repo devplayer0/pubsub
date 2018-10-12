@@ -1,7 +1,7 @@
 #![feature(euclidean_division)]
 
 use std::cmp;
-use std::mem::{self, size_of};
+use std::mem::size_of;
 use std::str::{self, Utf8Error};
 use std::fmt::{self, Display};
 use std::collections::LinkedList;
@@ -41,7 +41,7 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub const CONNECT_MAGIC: &'static [u8] = b"JQTT";
-pub const MAX_TOPIC_LENGTH: usize = IPV4_MAX_PACKET_SIZE - 1;
+pub const MAX_TOPIC_LENGTH: usize = IPV4_MAX_PACKET_SIZE - 1 - size_of::<u32>();
 
 #[inline]
 pub fn window_end(window_start: u8) -> u8 {
@@ -108,7 +108,7 @@ quick_error! {
             description("partial message")
             display("partial {} message", packet_type)
         }
-        MessageTooBig(expected: usize, actual: usize) {
+        MessageTooBig(expected: u32, actual: u32) {
             description("message is bigger than specified")
             display("message is {} bytes, specified as {}", actual, expected)
         }
@@ -145,14 +145,14 @@ impl Display for PacketType {
     }
 }
 
-#[derive(DebugStub)]
+#[derive(Debug)]
 pub enum Packet<'a> {
     Connect,
     Heartbeat,
     Ack(u8),
     Disconnect,
     Subscribe(&'a str),
-    Message(#[debug_stub = "Buf"] Box<Buf + Send + 'a>),
+    Message(IncomingMessage),
 }
 impl<'a> Packet<'a> {
     pub fn validate_connect(buffer: &Bytes) -> Result<Packet, GbnError> {
@@ -189,89 +189,118 @@ pub enum GbnTimeout {
     Ack(SocketAddr),
 }
 #[derive(DebugStub)]
-struct IncomingMessage {
-    total_size: usize,
-    size: usize,
+pub struct IncomingMessage {
+    topic_bytes: Bytes,
+    total_size: u32,
+    size: u32,
     #[debug_stub = "Chain"]
-    buffer: Box<Buf + Send>,
+    buffer: Option<Box<Buf + Send>>,
 }
 impl IncomingMessage {
-    fn new(total_size: usize, data: Bytes) -> Result<IncomingMessage, GbnError> {
-        if data.len() > total_size {
-            return Err(GbnError::MessageTooBig(total_size, data.len()));
-        }
+    fn new(mut data: Bytes) -> Result<IncomingMessage, GbnError> {
+        data.advance(1);
+        let mut buf = data.into_buf();
+        let total_size = buf.get_u32_be();
+        let pos = buf.position();
+        let mut data = buf.into_inner();
+        data.advance(pos as usize);
+        str::from_utf8(&data)?;
 
         Ok(IncomingMessage {
+            topic_bytes: data,
             total_size,
-            size: data.len(),
-            buffer: Box::new(data.into_buf()),
+            size: 0,
+            buffer: None,
         })
     }
-    fn full(&self) -> bool {
-        self.size == self.total_size
-    }
-    fn append(&mut self, data: Bytes) -> Result<bool, GbnError> {
-        let new_size = self.size + data.len();
+    fn append(&mut self, mut data: Bytes) -> Result<bool, GbnError> {
+        data.advance(1);
+        let new_size = self.size + data.len() as u32;
         println!("new size: {}, total size: {}", new_size, self.total_size);
         if new_size > self.total_size {
             return Err(GbnError::MessageTooBig(self.total_size, new_size));
         }
 
-        let buffer = mem::replace(&mut self.buffer, unsafe {
-            mem::uninitialized()
+        self.buffer = Some(if self.buffer.is_some() {
+            let buffer = self.buffer.take().unwrap();
+            Box::new(buffer.chain(data))
+        } else {
+            Box::new(data.into_buf())
         });
-        let null = mem::replace(&mut self.buffer, Box::new(buffer.chain(data)));
-        mem::forget(null);
 
         self.size = new_size;
         Ok(new_size == self.total_size)
     }
-    fn take(self) -> Box<Buf + Send> {
+
+    pub fn take(self) -> Box<Buf + Send> {
         assert_eq!(self.size, self.total_size);
-        self.buffer
+        self.buffer.unwrap()
+    }
+    pub fn collect(self) -> Vec<u8> {
+        self.buffer.unwrap().collect()
+    }
+    pub fn topic(&self) -> &str {
+        unsafe { str::from_utf8_unchecked(&self.topic_bytes) }
     }
 }
 #[derive(Debug)]
 pub struct OutgoingMessage<I: Read + Send> {
+    buf_source: BufferProvider,
+    publish_start: Option<BytesMut>,
     reader: I,
     size: u32,
     read: u32,
 }
 impl<I: Read + Send> OutgoingMessage<I> {
-    pub fn new(input: I, size: u32) -> OutgoingMessage<I> {
+    pub fn new(buf_source: &BufferProvider, topic: &str, input: I, size: u32) -> OutgoingMessage<I> {
+        let topic = topic.as_bytes();
+        assert!(topic.len() <= MAX_TOPIC_LENGTH);
+
+        let mut first_buffer = buf_source.allocate(1 + size_of::<u32>() + topic.len());
+        first_buffer.put_u8(0);
+        first_buffer.put_u32_be(size);
+        first_buffer.put(topic);
         OutgoingMessage {
+            buf_source: buf_source.clone(),
+            publish_start: Some(first_buffer),
             reader: input,
             size,
             read: 0,
         }
     }
-    pub fn into_boxed<'a, R: Read + Send + 'a>(msg: OutgoingMessage<R>) -> OutgoingMessage<Box<Read + Send + 'a>> {
+    fn into_boxed<'a, R: Read + Send + 'a>(msg: OutgoingMessage<R>) -> OutgoingMessage<Box<Read + Send + 'a>> {
         OutgoingMessage {
+            buf_source: msg.buf_source,
+            publish_start: msg.publish_start,
             reader: Box::new(msg.reader),
             size: msg.size,
             read: msg.read,
         }
     }
-    pub fn next_packet(&mut self, mut data: BytesMut, seq: u8) -> Result<(bool, Option<Bytes>), io::Error> {
+
+    fn first_sent(&self) -> bool {
+        !self.publish_start.is_some()
+    }
+    fn first_packet(&mut self, seq: u8) -> Bytes {
+        let mut data = self.publish_start.take().unwrap();
+        data[0] = Packet::encode_header(PacketType::PublishStart, seq);
+        data.freeze()
+    }
+    fn next_packet(&mut self, max_packet_size: usize, seq: u8) -> Result<(bool, Option<Bytes>), io::Error> {
         if self.read == self.size {
             return Ok((true, None));
         }
 
-        let header_size = if self.read == 0 {
-            data.put_u8(Packet::encode_header(PacketType::PublishStart, seq));
-            data.put_u32_be(self.size);
-            1 + size_of::<u32>()
-        } else {
-            data.put_u8(Packet::encode_header(PacketType::PublishData, seq));
-            1
-        };
-
-        let data_size = data.capacity() - header_size;
+        let header_size = 1;
+        let data_size = max_packet_size - header_size;
         let to_read = cmp::min((self.size - self.read) as usize, data_size);
+        let mut data = self.buf_source.allocate(header_size + to_read);
+        data.put_u8(Packet::encode_header(PacketType::PublishData, seq));
+
         data.truncate(header_size + to_read);
 
         unsafe {
-            self.reader.read_exact(&mut data.bytes_mut()[..to_read])?;
+            self.reader.read_exact(data.bytes_mut())?;
             data.advance_mut(to_read);
         }
 
@@ -393,13 +422,17 @@ impl GoBackN {
             Some(mut msg) => {
                 let mut full = self.window_full();
                 while !full {
-                    let buf = self.buf_source.allocate(self.max_packet_size());
-                    let (finished, data) = msg.next_packet(buf, self.send_seq)?;
-                    if let Some(data) = data {
-                        full = self.send_now(data)?;
-                    }
-                    if finished {
-                        return Ok(())
+                    if !msg.first_sent() {
+                        let data = msg.first_packet(self.send_seq);
+                        self.send_now(data)?;
+                    } else {
+                        let (finished, data) = msg.next_packet(self.max_packet_size(), self.send_seq)?;
+                        if let Some(data) = data {
+                            full = self.send_now(data)?;
+                        }
+                        if finished {
+                            return Ok(())
+                        }
                     }
                 }
 
@@ -468,30 +501,21 @@ impl GoBackN {
                 } else {
                     Err(Malformed(Subscribe))
                 },
-                PublishStart => match self.recv_publish_buf {
+                PublishStart => Err(match self.recv_publish_buf {
                     None => {
                         self.recv_slide(seq)?;
 
-                        let msg_len = data.get_u32_be() as usize;
-                        let pos = data.position() as usize;
-                        let msg_buf = IncomingMessage::new(msg_len, data.into_inner().slice_from(pos))?;
-
-                        match msg_buf.full() {
-                            false => {
-                                self.recv_publish_buf = Some(msg_buf);
-                                Err(Partial(PublishData))
-                            },
-                            true => Ok(Packet::Message(msg_buf.take()))
-                        }
+                        let msg = IncomingMessage::new(data.into_inner().clone())?;
+                        self.recv_publish_buf = Some(msg);
+                        Partial(PublishData)
                     },
-                    Some(_) => Err(InvalidPublishState(true)),
-                },
+                    Some(_) => InvalidPublishState(true),
+                }),
                 PublishData => match self.recv_publish_buf {
                     Some(_) => {
                         self.recv_slide(seq)?;
-                        let pos = data.position() as usize;
-                        match self.recv_publish_buf.as_mut().unwrap().append(data.into_inner().slice_from(pos))? {
-                            true => Ok(Packet::Message(self.recv_publish_buf.take().unwrap().take())),
+                        match self.recv_publish_buf.as_mut().unwrap().append(data.into_inner().clone())? {
+                            true => Ok(Packet::Message(self.recv_publish_buf.take().unwrap())),
                             false => Err(Partial(PublishData)),
                         }
                     },
