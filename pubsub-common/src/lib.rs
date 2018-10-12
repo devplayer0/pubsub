@@ -1,19 +1,22 @@
 #![feature(euclidean_division)]
 
 use std::cmp;
+use std::str::{self, Utf8Error};
 use std::fmt::{self, Display};
-use std::string::FromUtf8Error;
 use std::collections::LinkedList;
 use std::time::{Duration, Instant};
+use std::mem;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
 #[macro_use]
+extern crate enum_primitive;
+#[macro_use]
+extern crate debug_stub_derive;
+#[macro_use]
 extern crate quick_error;
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate enum_primitive;
 extern crate bytes;
 extern crate crossbeam_channel;
 extern crate priority_queue;
@@ -84,11 +87,26 @@ quick_error! {
             description(err.description())
             display("failed to send ack: {}", err)
         }
-        Utf8Decode(err: FromUtf8Error) {
+        Utf8Decode(err: Utf8Error) {
             from()
             cause(err)
             description(err.description())
             display("failed to decode string from packet: {}", err)
+        }
+        InvalidPublishState(started: bool) {
+            description("incorrect type of message publish packet for current state")
+            display("message publish {} started", match started {
+                true => "already",
+                false => "not",
+            })
+        }
+        Partial(packet_type: PacketType) {
+            description("partial message")
+            display("partial {} message", packet_type)
+        }
+        MessageTooBig(expected: usize, actual: usize) {
+            description("message is bigger than specified")
+            display("message is {} bytes, specified as {}", actual, expected)
         }
     }
 }
@@ -101,6 +119,8 @@ enum_from_primitive! {
         Ack = 2,
         Disconnect = 3,
         Subscribe = 4,
+        PublishStart = 5,
+        PublishData = 6,
     }
 }
 impl Display for PacketType {
@@ -112,19 +132,22 @@ impl Display for PacketType {
             Ack => "ACK",
             Disconnect => "DISCONNECT",
             Subscribe => "SUBSCRIBE",
+            PublishStart => "PUBLISH_START",
+            PublishData => "PUBLISH_DATA",
         })
     }
 }
 
-#[derive(Debug)]
-pub enum Packet {
+#[derive(DebugStub)]
+pub enum Packet<'a> {
     Connect,
     Heartbeat,
     Ack(u8),
     Disconnect,
-    Subscribe(String),
+    Subscribe(&'a str),
+    Message(#[debug_stub = "Buf"] Box<Buf + Send>),
 }
-impl Packet {
+impl<'a> Packet<'a> {
     pub fn validate_connect(buffer: &Bytes) -> Result<Packet, DecodeError> {
         if buffer.len() != 1 + CONNECT_MAGIC.len() || 
             PacketType::from_u8(buffer[0]) != Some(PacketType::Connect) || 
@@ -157,6 +180,49 @@ impl Packet {
 pub enum GbnTimeout {
     Heartbeat(SocketAddr),
 }
+#[derive(DebugStub)]
+struct MessageBuffer {
+    total_size: usize,
+    size: usize,
+    #[debug_stub = "Chain"]
+    buffer: Box<Buf + Send>,
+}
+impl MessageBuffer {
+    fn new(total_size: usize, data: Bytes) -> Result<MessageBuffer, DecodeError> {
+        if data.len() > total_size {
+            return Err(DecodeError::MessageTooBig(total_size, data.len()));
+        }
+
+        Ok(MessageBuffer {
+            total_size,
+            size: data.len(),
+            buffer: Box::new(data.into_buf()),
+        })
+    }
+    fn full(&self) -> bool {
+        self.size == self.total_size
+    }
+    fn append(&mut self, data: Bytes) -> Result<bool, DecodeError> {
+        let new_size = self.size + data.len();
+        println!("new size: {}, total size: {}", new_size, self.total_size);
+        if new_size > self.total_size {
+            return Err(DecodeError::MessageTooBig(self.total_size, new_size));
+        }
+
+        let buffer = mem::replace(&mut self.buffer, unsafe {
+            mem::uninitialized()
+        });
+        let null = mem::replace(&mut self.buffer, Box::new(buffer.chain(data)));
+        mem::forget(null);
+
+        self.size = new_size;
+        Ok(new_size == self.total_size)
+    }
+    fn take(self) -> Box<Buf + Send> {
+        assert_eq!(self.size, self.total_size);
+        self.buffer
+    }
+}
 #[derive(Debug)]
 pub struct GoBackN {
     timers: TimerManager<GbnTimeout>,
@@ -171,6 +237,7 @@ pub struct GoBackN {
     send_seq: u8,
 
     recv_seq: u8,
+    recv_publish_buf: Option<MessageBuffer>,
 }
 impl Drop for GoBackN {
     fn drop(&mut self) {
@@ -200,6 +267,7 @@ impl GoBackN {
             send_seq: 0,
 
             recv_seq: 0,
+            recv_publish_buf: None,
         }
     }
 
@@ -224,7 +292,7 @@ impl GoBackN {
         self.recv_seq = next_seq(seq);
         Ok(())
     }
-    pub fn decode(&mut self, data: &Bytes) -> Result<Packet, DecodeError> {
+    pub fn decode<'a>(&mut self, data: &'a Bytes) -> Result<Packet<'a>, DecodeError> {
         use DecodeError::*;
         use PacketType::*;
 
@@ -259,9 +327,39 @@ impl GoBackN {
                 },
                 Subscribe => if data.remaining() > 0 {
                     self.recv_slide(seq)?;
-                    Ok(Packet::Subscribe(String::from_utf8(data.collect())?))
+                    let pos = data.position();
+                    Ok(Packet::Subscribe(str::from_utf8(&data.into_inner()[pos as usize..])?))
                 } else {
                     Err(Malformed(Subscribe))
+                },
+                PublishStart => match self.recv_publish_buf {
+                    None => {
+                        self.recv_slide(seq)?;
+
+                        let msg_len = data.get_u32_be() as usize;
+                        let pos = data.position() as usize;
+                        let msg_buf = MessageBuffer::new(msg_len, data.into_inner().slice_from(pos))?;
+
+                        match msg_buf.full() {
+                            false => {
+                                self.recv_publish_buf = Some(msg_buf);
+                                Err(Partial(PublishData))
+                            },
+                            true => Ok(Packet::Message(msg_buf.take()))
+                        }
+                    },
+                    Some(_) => Err(InvalidPublishState(true)),
+                },
+                PublishData => match self.recv_publish_buf {
+                    Some(_) => {
+                        self.recv_slide(seq)?;
+                        let pos = data.position() as usize;
+                        match self.recv_publish_buf.as_mut().unwrap().append(data.into_inner().slice_from(pos))? {
+                            true => Ok(Packet::Message(self.recv_publish_buf.take().unwrap().take())),
+                            false => Err(Partial(PublishData)),
+                        }
+                    },
+                    None => Err(InvalidPublishState(false)),
                 },
             }
         } else {

@@ -1,9 +1,12 @@
 use super::*;
+use std::mem::size_of;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use std::thread;
 
 use crossbeam_channel as channel;
+
+const LIPSUM: &'static str = include_str!("lipsum.txt");
 
 #[test]
 fn timer() {
@@ -131,7 +134,11 @@ fn decode_subscribe() {
     // packet type 4, seq 0
     let subscribe = vec![(4 << SEQ_BITS) | 0, b'm', b'e', b'm', b'e', b's', b' ', 0xf0, 0x9f, 0xa4, 0x94].into();
     assert!(match &test_gbn().decode(&subscribe) {
-        Ok(Packet::Subscribe(msg)) if msg == "memes 🤔" => true,
+        Ok(Packet::Subscribe(msg)) if msg == &"memes 🤔" => true,
+        Ok(Packet::Subscribe(msg)) => {
+            println!("{}", msg);
+            false
+        },
         Err(e) => {
             println!("{}", e);
             false
@@ -143,4 +150,77 @@ fn decode_subscribe() {
 fn encode_subscribe() {
     let topic = Packet::make_subscribe(&mut BytesMut::with_capacity(11), "memes 🤔", 0);
     assert!(test_gbn().decode(&topic).is_ok());
+}
+
+#[test]
+fn decode_short_message() {
+    let text = "it is wednesday my dudes";
+    let mut message = BytesMut::with_capacity(1 + size_of::<u32>() + text.len());
+
+    // packet type 5 (publish start), seq 0
+    message.put_u8((5 << SEQ_BITS) | 0);
+    message.put_u32_be(text.len() as u32);
+    message.put(text);
+
+    assert!(match &test_gbn().decode(&message.freeze()) {
+        Ok(Packet::Message(data)) if str::from_utf8(data.bytes()).unwrap() == text => true,
+        Err(e) => {
+            println!("{}", e);
+            false
+        },
+        _ => false
+    });
+}
+#[test]
+fn decode_long_message() {
+    let mut packets = Vec::new();
+    let mut i = 0;
+    let mut seq = 0;
+    while i != LIPSUM.len() {
+        // not the exact right amount but who cares...
+        let mut buffer = BytesMut::with_capacity(1 + size_of::<u32>() + IPV4_MAX_PACKET_SIZE);
+        if i == 0 {
+            // packet type 5 (publish start)
+            buffer.put_u8((5 << SEQ_BITS) | seq);
+            buffer.put_u32_be(LIPSUM.len() as u32);
+        } else {
+            // packet type 6 (publish data)
+            buffer.put_u8((6 << SEQ_BITS) | seq);
+        }
+
+        let end = i + cmp::min(IPV4_MAX_PACKET_SIZE, LIPSUM.len() - i);
+        buffer.put(&LIPSUM[i..end]);
+        packets.push(buffer.freeze());
+
+        seq = next_seq(seq);
+        i = end;
+    }
+
+    let mut gbn = test_gbn();
+    for (i, packet) in packets.iter().enumerate() {
+        let result = gbn.decode(packet);
+        if i != packets.len() - 1 {
+            assert!(match result {
+                Err(DecodeError::Partial(PacketType::PublishData)) => true,
+                Err(e) => {
+                    println!("{}", e);
+                    false
+                },
+                Ok(_) => false,
+            });
+        } else {
+            assert!(match result {
+                Ok(Packet::Message(data)) => {
+                    let decoded = String::from_utf8(data.collect()).unwrap();
+                    println!("{}", decoded);
+                    decoded == LIPSUM
+                },
+                Err(e) => {
+                    println!("{}", e);
+                    false
+                },
+                Ok(_) => false,
+            });
+        }
+    }
 }
