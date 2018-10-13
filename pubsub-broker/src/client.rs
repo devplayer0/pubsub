@@ -64,6 +64,9 @@ impl Client {
                     self.gbn.queue_message(OutgoingMessage::new(&self.buf_source, "memes", bytes, lipsum.len() as u32))?;
                 }
             },
+            Packet::Unsubscribe(topic) => {
+                info!("{} wants to unsubscribe from '{}'", self.addr, topic);
+            },
             _ => return Err(Error::InvalidPacketType)
         }
 

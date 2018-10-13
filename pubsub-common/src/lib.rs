@@ -126,8 +126,9 @@ enum_from_primitive! {
         Ack = 2,
         Disconnect = 3,
         Subscribe = 4,
-        PublishStart = 5,
-        PublishData = 6,
+        Unsubscribe = 5,
+        PublishStart = 6,
+        PublishData = 7,
     }
 }
 impl Display for PacketType {
@@ -139,6 +140,7 @@ impl Display for PacketType {
             Ack => "ACK",
             Disconnect => "DISCONNECT",
             Subscribe => "SUBSCRIBE",
+            Unsubscribe => "UNSUBSCRIBE",
             PublishStart => "PUBLISH_START",
             PublishData => "PUBLISH_DATA",
         })
@@ -152,6 +154,7 @@ pub enum Packet<'a> {
     Ack(u8),
     Disconnect,
     Subscribe(&'a str),
+    Unsubscribe(&'a str),
     Message(IncomingMessage),
 }
 impl<'a> Packet<'a> {
@@ -494,10 +497,15 @@ impl GoBackN {
                     0 if seq == 0 => Ok(Packet::Disconnect),
                     _ => Err(Malformed(Disconnect)),
                 },
-                Subscribe => if data.remaining() > 0 {
+                Subscribe | Unsubscribe => if data.remaining() > 0 {
                     self.recv_slide(seq)?;
                     let pos = data.position();
-                    Ok(Packet::Subscribe(str::from_utf8(&data.into_inner()[pos as usize..])?))
+                    let topic = str::from_utf8(&data.into_inner()[pos as usize..])?;
+                    Ok(match t {
+                        Subscribe => Packet::Subscribe(topic),
+                        Unsubscribe => Packet::Unsubscribe(topic),
+                        _ => panic!("impossible"),
+                    })
                 } else {
                     Err(Malformed(Subscribe))
                 },

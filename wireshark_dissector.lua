@@ -4,8 +4,9 @@ packet_types = {
 	[2] = "ACK",
 	[3] = "DISCONNECT",
 	[4] = "SUBSCRIBE",
-	[5] = "PUBLISH_START",
-	[6] = "PUBLISH_DATA",
+	[5] = "UNSUBSCRIBE",
+	[6] = "PUBLISH_START",
+	[7] = "PUBLISH_DATA",
 }
 
 jqtt_proto = Proto("JQTT", "Jack QTT")
@@ -37,18 +38,18 @@ function jqtt_proto.dissector(buffer, pinfo, tree)
 		elseif p_type == 3 and buffer:len() == 1 and seq == 0 then
 			subtree:add(f_packet_type, 3)
 			return 1
-		elseif p_type == 4 and buffer:len() > 1 then
-			subtree:add(f_packet_type, 4)
+		elseif p_type == 4 or p_type == 5 and buffer:len() > 1 then
+			subtree:add(f_packet_type, p_type)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_topic_name, buffer(1, buffer:len() - 1))
 			return buffer:len()
-		elseif p_type == 5 and buffer:len() > 5 then
+		elseif p_type == 6 and buffer:len() > 5 then
 			subtree:add(f_packet_type, 5)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_message_size, buffer(1, 4))
 			subtree:add(f_topic_name, buffer(5, buffer:len() - 5))
 			return buffer:len()
-		elseif p_type == 6 and buffer:len() > 1 then
+		elseif p_type == 7 and buffer:len() > 1 then
 			subtree:add(f_packet_type, 6)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_message_payload, buffer(1, buffer:len() - 1))

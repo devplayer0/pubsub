@@ -157,8 +157,8 @@ fn decode_short_message() {
     let text = "it is wednesday my dudes";
     let mut publish_start = BytesMut::with_capacity(1 + size_of::<u32>() + topic.len());
 
-    // packet type 5 (publish start), seq 0
-    publish_start.put_u8((5 << SEQ_BITS) | 0);
+    // packet type 6 (publish start), seq 0
+    publish_start.put_u8((6 << SEQ_BITS) | 0);
     publish_start.put_u32_be(text.len() as u32);
     publish_start.put(topic);
 
@@ -174,8 +174,8 @@ fn decode_short_message() {
 
     let mut publish_data = BytesMut::with_capacity(1 + size_of::<u32>() + text.len());
 
-    // packet type 6 (publish data), seq 1
-    publish_data.put_u8((6 << SEQ_BITS) | 1);
+    // packet type 7 (publish data), seq 1
+    publish_data.put_u8((7 << SEQ_BITS) | 1);
     publish_data.put(text);
     assert!(match gbn.decode(&publish_data.freeze()) {
         Ok(Packet::Message(msg)) => {
@@ -195,8 +195,8 @@ fn decode_long_message() {
 
     {
         let mut buffer = BytesMut::with_capacity(1 + size_of::<u32>() + topic.len());
-        // packet type 5 (publish start)
-        buffer.put_u8((5 << SEQ_BITS) | 0);
+        // packet type 6 (publish start)
+        buffer.put_u8((6 << SEQ_BITS) | 0);
         buffer.put_u32_be(LIPSUM.len() as u32);
         buffer.put(topic);
         packets.push(buffer.freeze());
@@ -207,7 +207,7 @@ fn decode_long_message() {
     while i != LIPSUM.len() {
         // not the exact right amount but who cares...
         let mut buffer = BytesMut::with_capacity(1 + IPV4_MAX_PACKET_SIZE);
-        buffer.put_u8((6 << SEQ_BITS) | seq);
+        buffer.put_u8((7 << SEQ_BITS) | seq);
 
         let end = i + cmp::min(IPV4_MAX_PACKET_SIZE, LIPSUM.len() - i);
         buffer.put(&LIPSUM[i..end]);
