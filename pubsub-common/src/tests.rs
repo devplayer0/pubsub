@@ -1,9 +1,19 @@
-use super::*;
+use std::cmp;
 use std::str::FromStr;
+use std::mem::size_of;
 use std::time::{Duration, Instant};
 use std::thread;
+use std::net::{SocketAddr, UdpSocket};
 
+use bytes::{BufMut, BytesMut};
 use crossbeam_channel as channel;
+
+use super::*;
+use constants::*;
+use util::*;
+use timer::*;
+use packet::*;
+use jqtt::*;
 
 const LIPSUM: &'static str = include_str!("lipsum.txt");
 
@@ -100,15 +110,15 @@ fn encode_conn_packet() {
 }
 
 #[inline]
-fn test_gbn() -> GoBackN {
+fn test_gbn() -> Jqtt {
     let (tx, _) = channel::unbounded();
-    GoBackN::new(&TimerManager::new(), &BufferProvider::new(IPV6_MAX_PACKET_SIZE, IPV6_MAX_PACKET_SIZE), SocketAddr::from_str("127.0.0.1:1234").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), &tx, false)
+    Jqtt::new(&TimerManager::new(), &BufferProvider::new(IPV6_MAX_PACKET_SIZE, IPV6_MAX_PACKET_SIZE), SocketAddr::from_str("127.0.0.1:1234").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), &tx, false)
 }
 #[test]
 fn invalid_packet_type() {
     let packet = vec![(31 << SEQ_BITS)].into();
     assert!(match test_gbn().decode(&packet).unwrap_err() {
-        GbnError::InvalidType(31) => true,
+        Error::InvalidType(31) => true,
         _ => false,
     })
 }
@@ -123,7 +133,7 @@ fn decode_ack() {
 
     let bad_ack = vec![(2 << SEQ_BITS) | 7, 123].into();
     assert!(match test_gbn().decode(&bad_ack).unwrap_err() {
-        GbnError::Malformed(PacketType::Ack) => true,
+        Error::Malformed(PacketType::Ack) => true,
         _ => false,
     });
 }
@@ -164,7 +174,7 @@ fn decode_short_message() {
 
     let mut gbn = test_gbn();
     assert!(match gbn.decode(&publish_start.freeze()) {
-        Err(GbnError::Partial(PacketType::PublishData)) => true,
+        Err(Error::Partial(PacketType::PublishData)) => true,
         Err(e) => {
             println!("{}", e);
             false
@@ -222,7 +232,7 @@ fn decode_long_message() {
         let result = gbn.decode(packet);
         if i != packets.len() - 1 {
             assert!(match result {
-                Err(GbnError::Partial(PacketType::PublishData)) => true,
+                Err(Error::Partial(PacketType::PublishData)) => true,
                 Err(e) => {
                     println!("{}", e);
                     false

@@ -22,9 +22,10 @@ use bytes::{BufMut, Bytes};
 use crossbeam_channel as channel;
 use crossbeam_channel::{Sender, Receiver};
 
+use common::constants;
 use common::util::BufferProvider;
 use common::timer::TimerManager;
-use common::GbnTimeout;
+use common::jqtt::Timeout;
 
 pub mod config;
 mod client;
@@ -33,7 +34,7 @@ mod worker;
 use client::Client;
 use worker::{Worker, WorkerMessage};
 
-const BUFFER_PREALLOC_SIZE: usize = 1024 * common::IPV6_MAX_PACKET_SIZE;
+const BUFFER_PREALLOC_SIZE: usize = 1024 * constants::IPV6_MAX_PACKET_SIZE;
 
 quick_error! {
     #[derive(Debug)]
@@ -47,7 +48,7 @@ quick_error! {
             description(err.description())
             cause(err)
         }
-        Decode(err: common::GbnError) {
+        Decode(err: common::Error) {
             from()
             display("packet decode error: {}", err)
             description(err.description())
@@ -59,7 +60,7 @@ quick_error! {
 
 #[derive(Debug)]
 struct WorkerManager {
-    timers: TimerManager<GbnTimeout>,
+    timers: TimerManager<Timeout>,
     sockets: HashMap<SocketAddr, UdpSocket>,
     buf_source: BufferProvider,
 
@@ -142,7 +143,7 @@ impl Broker {
     pub fn bind<'a, I>(addrs: I, use_heartbeats: bool) -> Result<Broker, Error>
     where I: IntoIterator<Item = &'a SocketAddr>
     {
-        let buf_source = BufferProvider::new(BUFFER_PREALLOC_SIZE, common::IPV6_MAX_PACKET_SIZE);
+        let buf_source = BufferProvider::new(BUFFER_PREALLOC_SIZE, constants::IPV6_MAX_PACKET_SIZE);
 
         let mut sockets = Vec::new();
         for addr in addrs {
@@ -162,8 +163,8 @@ impl Broker {
         for socket in sockets {
             let addr = socket.local_addr().unwrap();
             let max_size = match addr {
-                SocketAddr::V4(_) => common::IPV4_MAX_PACKET_SIZE,
-                SocketAddr::V6(_) => common::IPV6_MAX_PACKET_SIZE,
+                SocketAddr::V4(_) => constants::IPV4_MAX_PACKET_SIZE,
+                SocketAddr::V6(_) => constants::IPV6_MAX_PACKET_SIZE,
             };
 
             let running = Arc::clone(&running);

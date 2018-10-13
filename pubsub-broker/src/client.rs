@@ -6,13 +6,14 @@ use crossbeam_channel::Sender;
 
 use common::util::BufferProvider;
 use common::timer::TimerManager;
-use common::{Packet, GoBackN, GbnTimeout, OutgoingMessage};
+use common::packet::Packet;
+use common::jqtt::{Jqtt, Timeout, OutgoingMessage};
 use ::Error;
 
 #[derive(Debug)]
 pub struct Client {
     addr: SocketAddr,
-    gbn: GoBackN,
+    gbn: Jqtt,
     buf_source: BufferProvider,
 
     pub connected: bool,
@@ -28,21 +29,21 @@ impl PartialEq for Client {
     }
 }
 impl Deref for Client {
-    type Target = GoBackN;
+    type Target = Jqtt;
     fn deref(&self) -> &Self::Target {
         &self.gbn
     }
 }
 impl DerefMut for Client {
-    fn deref_mut(&mut self) -> &mut GoBackN {
+    fn deref_mut(&mut self) -> &mut Jqtt {
         &mut self.gbn
     }
 }
 impl Client {
-    pub fn new(timers: &TimerManager<GbnTimeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_tx: &Sender<GbnTimeout>, use_heartbeats: bool) -> Client {
+    pub fn new(timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_tx: &Sender<Timeout>, use_heartbeats: bool) -> Client {
         Client {
             addr,
-            gbn: GoBackN::new(timers, buf_source, addr, socket, timeout_tx, use_heartbeats),
+            gbn: Jqtt::new(timers, buf_source, addr, socket, timeout_tx, use_heartbeats),
             buf_source: buf_source.clone(),
 
             connected: false,

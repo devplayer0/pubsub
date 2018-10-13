@@ -7,10 +7,12 @@ use bytes::Bytes;
 use crossbeam_channel as channel;
 use crossbeam_channel::Sender;
 
-use ::common::{self, Packet, GbnTimeout};
+use common;
 use common::timer::TimerManager;
+use common::packet::Packet;
+use common::jqtt::Timeout;
 use ::Error;
-use ::client::{Client};
+use client::{Client};
 
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum WorkerMessage {
@@ -21,16 +23,16 @@ pub enum WorkerMessage {
 
 #[derive(Debug)]
 pub struct Worker {
-    timers: TimerManager<GbnTimeout>,
+    timers: TimerManager<Timeout>,
 
     clients: Arc<RwLock<HashMap<SocketAddr, Mutex<Client>>>>,
     tx: Sender<WorkerMessage>,
-    timeout_tx: Sender<GbnTimeout>,
+    timeout_tx: Sender<Timeout>,
 
     thread: JoinHandle<()>,
 }
 impl Worker {
-    pub fn new(timers: &TimerManager<GbnTimeout>, disconnect_tx: Sender<WorkerMessage>) -> Worker {
+    pub fn new(timers: &TimerManager<Timeout>, disconnect_tx: Sender<WorkerMessage>) -> Worker {
         let clients: Arc<RwLock<HashMap<_, Mutex<Client>>>> = Arc::new(RwLock::new(HashMap::new()));
         let (tx, rx) = channel::unbounded();
         let (timeout_tx, timeout_rx) = channel::unbounded();
@@ -43,7 +45,7 @@ impl Worker {
                         recv(timeout_rx, msg) => {
                             if let Some(msg) = msg {
                                 match msg {
-                                    GbnTimeout::Heartbeat(src) => {
+                                    Timeout::Heartbeat(src) => {
                                         error!("client {} timed out, disconnecting...", src);
                                         let mut clients = clients.write().unwrap();
                                         {
@@ -56,7 +58,7 @@ impl Worker {
                                         clients.remove(&src);
                                         disconnect_tx.send(WorkerMessage::Disconnect(src));
                                     },
-                                    GbnTimeout::Ack(src) => {
+                                    Timeout::Ack(src) => {
                                         let clients = clients.read().unwrap();
                                         let mut client = clients[&src].lock().unwrap();
                                         warn!("client {} ack timed out, re-sending packets in window", src);
@@ -107,7 +109,7 @@ impl Worker {
                                                     Packet::Disconnect => Ok(true),
                                                     _ => client.handle(packet).map(|_| false),
                                                 },
-                                                Err(e@common::GbnError::OutOfOrder(_, _)) => {
+                                                Err(e@common::Error::OutOfOrder(_, _)) => {
                                                     warn!("{}", e);
                                                     Ok(false)
                                                 },
@@ -161,7 +163,7 @@ impl Worker {
             thread,
         }
     }
-    pub fn tx(&self) -> (Sender<WorkerMessage>, Sender<GbnTimeout>) {
+    pub fn tx(&self) -> (Sender<WorkerMessage>, Sender<Timeout>) {
         (self.tx.clone(), self.timeout_tx.clone())
     }
     pub fn stop(self) {
