@@ -1,6 +1,7 @@
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex, Condvar};
 use std::process;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 #[macro_use]
 extern crate log;
@@ -12,7 +13,22 @@ extern crate pubsub_broker;
 use simplelog::{LevelFilter, TermLogger};
 
 use pubsub_broker::Broker;
-use pubsub_broker::config::Config;
+
+pub struct Config {
+    bind_addrs: Vec<SocketAddr>,
+}
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            bind_addrs: "localhost:26999".to_socket_addrs().unwrap().collect(),
+        }
+    }
+}
+impl Config {
+    pub fn bind_addrs(&self) -> &Vec<SocketAddr> {
+        &self.bind_addrs
+    }
+}
 
 fn run(config: Config) -> Result<(), Box<dyn StdError>> {
     info!("starting broker");
@@ -34,7 +50,7 @@ fn run(config: Config) -> Result<(), Box<dyn StdError>> {
         })?;
     }
 
-    let broker = Broker::bind(config.bind_addrs(), false)?;
+    let broker = Broker::bind(config.bind_addrs(), true)?;
 
     let &(ref stop_lock, ref stop_cond) = &*stop;
     let mut stop = stop_lock.lock().unwrap();

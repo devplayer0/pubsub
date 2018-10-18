@@ -5,7 +5,6 @@ authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
 
 [dependencies]
 enum_primitive = "~0.1"
-debug_stub_derive = "~0.3"
 quick-error = "~1.2"
 log = "~0.4"
 bytes = "~0.4"

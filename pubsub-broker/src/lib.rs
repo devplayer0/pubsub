@@ -1,9 +1,13 @@
+#![feature(try_from)]
+#![feature(integer_atomics)]
+
 use std::any::Any;
+use std::cmp;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::thread::{self, ThreadId};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{Ordering, AtomicBool, AtomicUsize, AtomicU32};
+use std::sync::{Arc, Mutex, RwLock};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
@@ -23,18 +27,18 @@ use crossbeam_channel as channel;
 use crossbeam_channel::{Sender, Receiver};
 
 use common::constants;
-use common::util::BufferProvider;
+use common::util::{self, BufferProvider};
 use common::timer::TimerManager;
-use common::jqtt::Timeout;
+use common::packet::PacketType;
+use common::protocol::Timeout;
 
-pub mod config;
 mod client;
 mod worker;
 
 use client::Client;
 use worker::{Worker, WorkerMessage};
 
-const BUFFER_PREALLOC_SIZE: usize = 1024 * constants::IPV6_MAX_PACKET_SIZE;
+const BUFFER_PREALLOC_SIZE: usize = 16384 * constants::IPV6_MAX_PACKET_SIZE;
 
 quick_error! {
     #[derive(Debug)]
@@ -48,13 +52,40 @@ quick_error! {
             description(err.description())
             cause(err)
         }
-        Decode(err: common::Error) {
+        Protocol(err: common::Error) {
             from()
-            display("packet decode error: {}", err)
+            display("protocol error: {}", err)
             description(err.description())
             cause(err)
         }
-        InvalidPacketType
+        ServerOnly(packet_type: PacketType) {
+            description("received packet which can only be sent by servers")
+            display("received packet which can only be sent by servers: {}", packet_type)
+        }
+        KeepaliveDisabled {
+            description("keepalive is disabled")
+        }
+        DisconnectAction
+        AlreadySubscribed(topic: String, subscriber: SocketAddr) {
+            description("user is already subscribed")
+            display("user {} is already subscribed to {}", subscriber, topic)
+        }
+        NotSubscribed(topic: String, subscriber: SocketAddr) {
+            description("user is not subscribed")
+            display("user {} is not subscribed to {}", subscriber, topic)
+        }
+        PublishNotStarted(src: SocketAddr, id: u32) {
+            description("publish has not started")
+            display("publish has not started for message with id {} from {}", id, src)
+        }
+        PublishAlreadyStarted(src: SocketAddr, id: u32) {
+            description("publish has already started")
+            display("publish has already started for message with id {} from {}", id, src)
+        }
+        MessageTooBig(src: SocketAddr, id: u32, expected: u32, actual: u32) {
+            description("message too big")
+            display("message with server id {} from {} is too big (expected: {}, actual: {})", id, src, expected, actual)
+        }
     }
 }
 
@@ -68,21 +99,28 @@ struct WorkerManager {
     next_worker: AtomicUsize,
     workers: Vec<Worker>,
 
+    next_message_id: Arc<AtomicU32>,
     client_assignments: HashMap<SocketAddr, Sender<WorkerMessage>>,
     disconnect_rx: Receiver<WorkerMessage>,
 }
 impl WorkerManager {
     pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool) -> WorkerManager {
-        let timers = TimerManager::new();
-        let mut workers = Vec::with_capacity(num_cpus::get());
+        let worker_count = cmp::max(num_cpus::get() - 1, 1);
+        info!("creating {} workers...", worker_count);
+
+        let mut workers = Vec::with_capacity(worker_count);
+        let worker_txs = Arc::new(RwLock::new(Vec::with_capacity(worker_count)));
         let (disconnect_tx, disconnect_rx) = channel::unbounded();
-        info!("creating {} workers...", workers.capacity());
-        for _ in 0..workers.capacity() {
-            workers.push(Worker::new(&timers, disconnect_tx.clone()));
+
+        for _ in 0..worker_count {
+            let worker = Worker::new(&worker_txs, &disconnect_tx);
+            let (worker_tx, _) = worker.tx();
+            worker_txs.write().unwrap().push(worker_tx);
+            workers.push(worker);
         }
 
         WorkerManager {
-            timers,
+            timers: TimerManager::new(),
             sockets: sockets.into_iter().map(|s| (s.local_addr().unwrap(), s)).collect(),
             buf_source: buf_source.clone(),
 
@@ -90,6 +128,7 @@ impl WorkerManager {
             workers,
             next_worker: AtomicUsize::new(0),
 
+            next_message_id: Arc::new(AtomicU32::new(0)),
             client_assignments: HashMap::new(),
             disconnect_rx,
         }
@@ -106,7 +145,7 @@ impl WorkerManager {
     pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Bytes) {
         while !self.disconnect_rx.is_empty() {
             match self.disconnect_rx.recv().unwrap() {
-                WorkerMessage::Disconnect(client) => { self.client_assignments.remove(&client).unwrap(); },
+                WorkerMessage::Disconnect(client) => { debug!("removing client assignment {}", client); self.client_assignments.remove(&client).unwrap(); },
                 _ => panic!("impossible"),
             }
         }
@@ -115,7 +154,7 @@ impl WorkerManager {
             let tx = {
                 let worker = self.next_worker();
                 let (tx, timeout_tx) = worker.tx();
-                let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, &timeout_tx, self.use_heartbeats);
+                let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, &timeout_tx, self.use_heartbeats, &self.next_message_id);
                 worker.assign(client);
                 tx
             };
@@ -162,17 +201,13 @@ impl Broker {
         let mut io_threads = Vec::new();
         for socket in sockets {
             let addr = socket.local_addr().unwrap();
-            let max_size = match addr {
-                SocketAddr::V4(_) => constants::IPV4_MAX_PACKET_SIZE,
-                SocketAddr::V6(_) => constants::IPV6_MAX_PACKET_SIZE,
-            };
 
             let running = Arc::clone(&running);
             let mut buf_source = buf_source.clone();
             let clients = Arc::clone(&clients);
             io_threads.push(thread::spawn(move || {
                 while running.load(Ordering::SeqCst) {
-                    let mut packet_buffer = buf_source.allocate(max_size);
+                    let mut packet_buffer = buf_source.allocate(util::max_packet_size(addr));
 
                     let (size, src) = unsafe {
                         let (size, src) = match socket.recv_from(packet_buffer.bytes_mut()) {

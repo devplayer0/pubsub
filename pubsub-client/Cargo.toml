@@ -4,3 +4,10 @@ version = "0.1.0"
 authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
 
 [dependencies]
+quick-error = "~1.2"
+debug_stub_derive = "~0.3"
+log = "~0.4"
+simplelog = "~0.5"
+bytes = "~0.4"
+crossbeam-channel = "~0.2"
+pubsub-common = { path = "../pubsub-common" }

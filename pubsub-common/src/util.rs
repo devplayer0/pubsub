@@ -1,7 +1,18 @@
 use std::cmp;
 use std::sync::{Arc, Mutex};
+use std::net::SocketAddr;
 
-use ::bytes::BytesMut;
+use bytes::BytesMut;
+
+use constants;
+
+#[inline]
+pub fn max_packet_size(addr: SocketAddr) -> usize {
+    match addr {
+        SocketAddr::V4(_) => constants::IPV4_MAX_PACKET_SIZE,
+        SocketAddr::V6(_) => constants::IPV6_MAX_PACKET_SIZE,
+    }
+}
 
 #[derive(Debug)]
 pub struct BufferProvider {

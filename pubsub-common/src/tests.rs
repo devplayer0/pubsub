@@ -13,7 +13,7 @@ use constants::*;
 use util::*;
 use timer::*;
 use packet::*;
-use jqtt::*;
+use protocol::*;
 
 const LIPSUM: &'static str = include_str!("lipsum.txt");
 
@@ -91,29 +91,24 @@ fn t_next_seq() {
     assert_eq!(next_seq(3), 4);
 }
 
-#[test]
-fn valid_conn_packet() {
-    let valid = vec![0, b'J', b'Q', b'T', b'T'].into();
-    assert!(Packet::validate_connect(&valid).is_ok());
-
-    assert!(Packet::validate_connect(&vec![b'J', b'Q', b'T', b'T'].into()).is_err());
-    assert!(Packet::validate_connect(&vec![0, b'J', b'Q', b'T'].into()).is_err());
-    assert!(Packet::validate_connect(&vec![b'M', b'Q', b'T', b'T'].into()).is_err());
-    assert!(Packet::validate_connect(&vec![b'J', b'Q', b'T', b'T', b'1'].into()).is_err());
-    assert!(Packet::validate_connect(&vec![b'1', b'J', b'Q', b'T', b'T'].into()).is_err());
-    assert!(Packet::validate_connect(&vec![b'j', b'q', b't', b't'].into()).is_err());
-}
-#[test]
-fn encode_conn_packet() {
-    let connect = Packet::make_connect();
-    assert!(Packet::validate_connect(&connect).is_ok());
-}
-
 #[inline]
 fn test_gbn() -> Jqtt {
     let (tx, _) = channel::unbounded();
-    Jqtt::new(&TimerManager::new(), &BufferProvider::new(IPV6_MAX_PACKET_SIZE, IPV6_MAX_PACKET_SIZE), SocketAddr::from_str("127.0.0.1:1234").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), &tx, false)
+    Jqtt::new(&TimerManager::new(), &BufferProvider::new(IPV6_MAX_PACKET_SIZE, IPV6_MAX_PACKET_SIZE), SocketAddr::from_str("127.0.0.1:1234").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), &tx)
 }
+#[test]
+fn valid_conn_packet() {
+    let valid = vec![0, b'J', b'Q', b'T', b'T'].into();
+    assert!(test_gbn().decode(&valid).is_ok());
+
+    assert!(test_gbn().decode(&vec![b'J', b'Q', b'T', b'T'].into()).is_err());
+    assert!(test_gbn().decode(&vec![0, b'J', b'Q', b'T'].into()).is_err());
+    assert!(test_gbn().decode(&vec![b'M', b'Q', b'T', b'T'].into()).is_err());
+    assert!(test_gbn().decode(&vec![b'J', b'Q', b'T', b'T', b'1'].into()).is_err());
+    assert!(test_gbn().decode(&vec![b'1', b'J', b'Q', b'T', b'T'].into()).is_err());
+    assert!(test_gbn().decode(&vec![b'j', b'q', b't', b't'].into()).is_err());
+}
+
 #[test]
 fn invalid_packet_type() {
     let packet = vec![(31 << SEQ_BITS)].into();
@@ -124,14 +119,14 @@ fn invalid_packet_type() {
 }
 #[test]
 fn decode_ack() {
-    // packet type 2, seq 7
-    let ack = vec![(2 << SEQ_BITS) | 7].into();
+    // packet type 3, seq 0
+    let ack = vec![(3 << SEQ_BITS) | 0].into();
     assert!(match test_gbn().decode(&ack).unwrap() {
-        Packet::Ack(7) => true,
+        Packet::Ack(0) => true,
         _ => false,
     });
 
-    let bad_ack = vec![(2 << SEQ_BITS) | 7, 123].into();
+    let bad_ack = vec![(3 << SEQ_BITS) | 7, 123].into();
     assert!(match test_gbn().decode(&bad_ack).unwrap_err() {
         Error::Malformed(PacketType::Ack) => true,
         _ => false,
@@ -140,8 +135,8 @@ fn decode_ack() {
 
 #[test]
 fn decode_subscribe() {
-    // packet type 4, seq 0
-    let subscribe = vec![(4 << SEQ_BITS) | 0, b'm', b'e', b'm', b'e', b's', b' ', 0xf0, 0x9f, 0xa4, 0x94].into();
+    // packet type 5, seq 0
+    let subscribe = vec![(5 << SEQ_BITS) | 0, b'm', b'e', b'm', b'e', b's', b' ', 0xf0, 0x9f, 0xa4, 0x94].into();
     assert!(match &test_gbn().decode(&subscribe) {
         Ok(Packet::Subscribe(msg)) if msg == &"memes 🤔" => true,
         Ok(Packet::Subscribe(msg)) => {
@@ -155,13 +150,8 @@ fn decode_subscribe() {
         _ => false
     });
 }
-#[test]
-fn encode_subscribe() {
-    let topic = Packet::make_subscribe(&mut BytesMut::with_capacity(11), "memes 🤔", 0);
-    assert!(test_gbn().decode(&topic).is_ok());
-}
 
-#[test]
+/*#[test]
 fn decode_short_message() {
     let topic = "memes";
     let text = "it is wednesday my dudes";
@@ -258,4 +248,4 @@ fn decode_long_message() {
             });
         }
     }
-}
+}*/
