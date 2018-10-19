@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 use std::cmp;
 use std::mem::size_of;
 use std::str;
+use std::collections::HashMap;
 use std::io::{self, Read};
 
 use bytes::{IntoBuf, Buf, BufMut, Bytes, BytesMut, Reader};
@@ -65,22 +66,25 @@ pub(crate) struct OutgoingMessage<'a> {
 
     #[debug_stub = "Message"]
     message: Message<Box<Read + Send + 'a>>,
+    id: u32,
     publish_start: Option<BytesMut>,
     read: u32,
 }
 impl<'a> OutgoingMessage<'a> {
-    pub(crate) fn new<R: Read + Send + 'a>(buf_source: &BufferProvider, message: Message<R>) -> OutgoingMessage<'a> {
+    pub(crate) fn new<R: Read + Send + 'a>(buf_source: &BufferProvider, message: Message<R>, id: u32) -> OutgoingMessage<'a> {
         let topic_len = message.topic().as_bytes().len();
         assert!(topic_len <= MAX_TOPIC_LENGTH);
 
-        let mut first_buffer = buf_source.allocate(1 + size_of::<u32>() + topic_len);
+        let mut first_buffer = buf_source.allocate(1 + size_of::<u32>() + size_of::<u32>() + topic_len);
         first_buffer.put_u8(0);
+        first_buffer.put_u32_be(id);
         first_buffer.put_u32_be(message.size());
         first_buffer.put(message.topic());
         OutgoingMessage {
             buf_source: buf_source.clone(),
 
             message: Message::<R>::into_boxed(message),
+            id,
             publish_start: Some(first_buffer),
             read: 0,
         }
@@ -99,11 +103,12 @@ impl<'a> OutgoingMessage<'a> {
             return Ok((true, None));
         }
 
-        let header_size = 1;
+        let header_size = 1 + size_of::<u32>();
         let data_size = max_packet_size - header_size;
         let to_read = cmp::min((self.message.size - self.read) as usize, data_size);
         let mut data = self.buf_source.allocate(header_size + to_read);
         data.put_u8(Packet::encode_header(PacketType::PublishData, seq));
+        data.put_u32_be(self.id);
 
         data.truncate(header_size + to_read);
         unsafe {
@@ -137,10 +142,8 @@ impl IncomingMessage {
             buffer: None,
         }
     }
-    fn append(&mut self, mut data: MessageSegment) -> Result<bool, Error> {
-        data.advance(1);
+    fn append(&mut self, data: MessageSegment) -> Result<bool, Error> {
         let new_size = self.size + data.len() as u32;
-        println!("new size: {}, total size: {}", new_size, self.start.size());
         if new_size > self.start.size() {
             return Err(Error::MessageTooBig(self.start.size(), new_size));
         }
@@ -172,36 +175,36 @@ pub trait CompleteMessageListener {
 }
 pub struct MessageCollector<L: CompleteMessageListener> {
     listener: L,
-    message: Option<IncomingMessage>,
+    messages: HashMap<u32, IncomingMessage>,
 }
 impl<L: CompleteMessageListener> MessageCollector<L> {
     pub fn new(listener: L) -> MessageCollector<L> {
         MessageCollector {
             listener,
-            message: None,
+            messages: HashMap::new(),
         }
     }
 }
 impl<L: CompleteMessageListener> MessageListener for MessageCollector<L> {
     fn recv_start(&mut self, start: MessageStart) -> Result<(), Error> {
-        match self.message {
+        match self.messages.get(&start.id()) {
             None => {
-                self.message = Some(IncomingMessage::new(start));
+                self.messages.insert(start.id(), IncomingMessage::new(start));
                 Ok(())
             },
-            Some(_) => Err(Error::InvalidPublishState(true)),
+            Some(_) => Err(Error::InvalidPublishState(start.id(), true)),
         }
     }
     fn recv_data(&mut self, data: MessageSegment) -> Result<(), Error> {
-        if self.message.is_some() {
-            if self.message.as_mut().unwrap().append(data)? {
-                self.listener.recv_message(self.message.take().unwrap().into_message())?;
-            }
-
-            Ok(())
-        } else {
-            Err(Error::InvalidPublishState(false))
+        let id = data.id();
+        if match self.messages.get_mut(&id) {
+            Some(info) => info.append(data)?,
+            None => return Err(Error::InvalidPublishState(data.id(), false)),
+        } {
+            self.listener.recv_message(self.messages.remove(&id).unwrap().into_message())?;
         }
+
+        Ok(())
     }
     fn on_error(&mut self, error: Error) {
         self.listener.on_error(error);

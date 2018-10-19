@@ -149,9 +149,16 @@ impl Worker {
                                         };
                                         if let Err(e) = match action {
                                             Action::Disconnect => Err(Error::DisconnectAction),
-                                            Action::Subscribe(topic) => subscriptions.subscribe(topic, src),
-                                            Action::Unsubscribe(topic) => subscriptions.unsubscribe(topic, src),
+                                            Action::Subscribe(topic) => {
+                                                debug!("subscribing {} to {}", src, topic);
+                                                subscriptions.subscribe(topic, src)
+                                            },
+                                            Action::Unsubscribe(topic) => {
+                                                debug!("unsubscribing {} from {}", src, topic);
+                                                subscriptions.unsubscribe(topic, src)
+                                            },
                                             Action::DispatchStart(mut start) => {
+                                                info!("starting publish message for topic {}", start.topic());
                                                 for worker_tx in worker_txs.read().unwrap().iter() {
                                                     worker_tx.send(WorkerMessage::DispatchStart(src, start.clone()));
                                                 }
@@ -179,7 +186,7 @@ impl Worker {
                                         }
                                     },
                                     m@WorkerMessage::DispatchStart(_, _) | m@WorkerMessage::DispatchSegment(_, _) => {
-                                        let (src, topic) = match m {
+                                        let (_, topic) = match m {
                                             WorkerMessage::DispatchStart(src, ref start) => (src, start.topic()),
                                             WorkerMessage::DispatchSegment(src, ref segment) => (src, segment.topic().unwrap()),
                                             _ => panic!("impossible"),
@@ -192,10 +199,23 @@ impl Worker {
                                         let mut error = None;
                                         let r_clients = clients.read().unwrap();
                                         for addr in subs {
-                                            let mut client = r_clients[&src].lock().unwrap();
+                                            let mut client = r_clients[addr].lock().unwrap();
                                             if let Err(e) = match m {
-                                                WorkerMessage::DispatchStart(_, ref start) => client.send_msg_start(&start),
-                                                WorkerMessage::DispatchSegment(_, ref segment) => client.send_msg_segment(&segment),
+                                                WorkerMessage::DispatchStart(msg_src, ref start) => {
+                                                    if msg_src == *addr {
+                                                        continue;
+                                                    }
+
+                                                    debug!("starting publish for topic {} to {}", start.topic(), addr);
+                                                    client.send_msg_start(&start)
+                                                },
+                                                WorkerMessage::DispatchSegment(msg_src, ref segment) => {
+                                                    if msg_src == *addr {
+                                                        continue;
+                                                    }
+
+                                                    client.send_msg_segment(&segment)
+                                                }
                                                 _ => panic!("impossible"),
                                             } {
                                                 error = Some((*addr, e));

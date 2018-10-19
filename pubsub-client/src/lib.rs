@@ -1,6 +1,5 @@
 use std::error::Error as StdError;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Condvar};
 use std::sync::atomic::{Ordering, AtomicBool};
 use std::time::{Duration, Instant};
 use std::thread::{self, JoinHandle};
@@ -35,6 +34,23 @@ use messaging::OutgoingMessage;
 
 const BUFFER_PREALLOC_SIZE: usize = 1024 * constants::IPV6_MAX_PACKET_SIZE;
 
+macro_rules! await_sendbuf_space {
+    ($condvar:expr, $running:expr, $space:expr) => {{
+        let &(ref lock, ref cvar) = &*$condvar;
+        let mut avail = lock.lock().unwrap();
+        while *avail < $space {
+            avail = cvar.wait(avail).unwrap();
+            if !$running.load(Ordering::SeqCst) {
+                return Err(Error::Interrupted);
+            }
+        }
+    }};
+    ($condvar:expr, $running:expr) => (await_sendbuf_space!($condvar, $running, 1));
+}
+macro_rules! await_packet_ack {
+    ($condvar:expr, $running:expr, $pid:expr) => (await_sendbuf_space!($condvar, $running, $pid));
+}
+
 quick_error! {
     #[derive(Debug)]
     pub enum Error {
@@ -60,9 +76,9 @@ quick_error! {
         ReceivedDisconnect {
             description("received disconnect packet from server")
         }
-        InvalidPublishState(started: bool) {
+        InvalidPublishState(id: u32, started: bool) {
             description("incorrect type of incoming message packet for current state")
-            display("incoming message {} started", match started {
+            display("incoming message {} {} started", id, match started {
                 true => "already",
                 false => "not",
             })
@@ -74,10 +90,25 @@ quick_error! {
         MessageAlreadyQueued {
             description("a message is already queued for publishing")
         }
-        Custom(err: Box<StdError>) {
+        Interrupted {
+            description("action interrupted by shutdown")
+        }
+        Shutdown {
+            description("client is shut down")
+        }
+        Std(err: Box<StdError>) {
             from()
             display("{}", err)
             description(err.description())
+        }
+        CustomStatic(msg: &'static str) {
+            from()
+            description(msg)
+            display("{}", msg)
+        }
+        Custom(msg: String) {
+            from()
+            display("{}", msg)
         }
     }
 }
@@ -146,8 +177,12 @@ pub struct Client<'a> {
     io_thread: JoinHandle<()>,
     inner_tx: Sender<InternalMessage>,
     inner_thread: JoinHandle<()>,
+
+    acked_pid: Arc<(Mutex<usize>, Condvar)>,
+    send_space: Arc<(Mutex<usize>, Condvar)>,
+    next_msg_id: u32,
     #[debug_stub = "VecDeque<OutgoingMessage>"]
-    messages: VecDeque<OutgoingMessage<'a>>,
+    messages: Vec<OutgoingMessage<'a>>,
 }
 impl<'a> Client<'a> {
     fn udp_connect<A: ToSocketAddrs>(addr: A) -> io::Result<(SocketAddr, UdpSocket)> {
@@ -215,6 +250,11 @@ impl<'a> Client<'a> {
             let running = Arc::clone(&running);
             let buf_source = buf_source.clone();
             let inner_tx = inner_tx.clone();
+
+            let (acked_pid, send_space) = {
+                let protocol = protocol.lock().unwrap();
+                (protocol.ack_condvar(), protocol.send_space_condvar())
+            };
             thread::spawn(move || {
                 while running.load(Ordering::SeqCst) {
                     let mut packet_buffer = buf_source.allocate(util::max_packet_size(remote));
@@ -236,6 +276,11 @@ impl<'a> Client<'a> {
                     packet_buffer.truncate(size);
                     inner_tx.send(InternalMessage::Packet(packet_buffer.freeze()));
                 }
+
+                let &(ref _lock, ref cvar) = &*send_space;
+                cvar.notify_all();
+                let &(ref _lock, ref cvar) = &*acked_pid;
+                cvar.notify_all();
             })
         };
 
@@ -313,6 +358,10 @@ impl<'a> Client<'a> {
             })
         };
 
+        let (acked_pid, send_space) = {
+            let protocol = protocol.lock().unwrap();
+            (protocol.ack_condvar(), protocol.send_space_condvar())
+        };
         Ok(Client {
             buf_source: buf_source.clone(),
             protocol,
@@ -321,7 +370,11 @@ impl<'a> Client<'a> {
             io_thread,
             inner_tx,
             inner_thread,
-            messages: VecDeque::new(),
+
+            acked_pid,
+            send_space,
+            next_msg_id: 0,
+            messages: Vec::new(),
         })
     }
     pub fn stop(self) {
@@ -333,43 +386,79 @@ impl<'a> Client<'a> {
     }
 
     pub fn subscribe(&self, topic: &str) -> Result<(), Error> {
-        self.protocol.lock().unwrap().send_subscribe(topic)?;
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(Error::Shutdown);
+        }
+        await_sendbuf_space!(self.send_space, self.running);
+
+        let pid = self.protocol.lock().unwrap().send_subscribe(topic)?;
+        await_packet_ack!(self.acked_pid, self.running, pid);
+
         Ok(())
     }
     pub fn unsubscribe(&self, topic: &str) -> Result<(), Error> {
-        self.protocol.lock().unwrap().send_unsubscribe(topic)?;
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(Error::Shutdown);
+        }
+        await_sendbuf_space!(self.send_space, self.running);
+
+        let pid = self.protocol.lock().unwrap().send_unsubscribe(topic)?;
+        await_packet_ack!(self.acked_pid, self.running, pid);
+
         Ok(())
     }
 
-    pub fn queue_message<R: Read + Send + 'a>(&mut self, message: Message<R>) {
-        self.messages.push_back(OutgoingMessage::new(&self.buf_source, message));
-    }
-    /*fn drain_messages(&mut self) -> Result<(), Error> {
-        if self.protocol.buffer_full()() {
-            return Ok(());
+    pub fn queue_message<R: Read + Send + 'a>(&mut self, message: Message<R>) -> Result<(), Error> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(Error::Shutdown);
         }
 
-        for _ in 0..self.messages.len() {
-            if {
-                let mut msg = self.messages.front_mut().unwrap();
-                loop {
+        self.messages.push(OutgoingMessage::new(&self.buf_source, message, self.next_msg_id));
+        self.next_msg_id = self.next_msg_id.wrapping_add(1);
+        Ok(())
+    }
+    pub fn drain_messages(&mut self) -> Result<(), Error> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(Error::Shutdown);
+        }
+
+        while !self.messages.is_empty() {
+            await_sendbuf_space!(self.send_space, self.running, 32);
+            let mut protocol = self.protocol.lock().unwrap();
+
+            let mut finished = false;
+            let mut i = 0;
+            let mut pid = 0;
+            while !protocol.send_buffer_full() {
+                {
+                    let msg = self.messages.get_mut(i).unwrap();
                     if !msg.first_sent() {
-                        let data = msg.first_packet(self.protocol.send_seq());
-                        self.protocol.gbn_send(data)?;
+                        let data = msg.first_packet(protocol.send_seq());
+                        pid = protocol.gbn_send(data)?;
                     } else {
-                        let (finished, data) = msg.next_packet(util::max_packet_size(self.remote), self.protocol.send_seq())?;
-                        if let Some(data) = data {
-                            if self.protocol.gbn_send(data)? {
-                                break finished;
-                            }
+                        let (fin, data) = msg.next_packet(protocol.max_packet_size(), protocol.send_seq())?;
+                        pid = protocol.gbn_send(data.unwrap())?;
+                        if fin {
+                            finished = true;
+                            break;
                         }
                     }
                 }
-            } {
-                self.messages.pop_front().unwrap();
+
+                i += 1;
+                if i == self.messages.len() {
+                    i = 0;
+                }
             }
+
+            if finished {
+                self.messages.remove(i);
+            }
+
+            drop(protocol);
+            await_packet_ack!(self.acked_pid, self.running, pid);
         }
 
         Ok(())
-    }*/
+    }
 }

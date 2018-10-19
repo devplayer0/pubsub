@@ -90,9 +90,10 @@ impl MessageMapping {
             return Err(Error::PublishAlreadyStarted(self.src, start.id()));
         }
 
+        let orig = start.id();
         let mapped = self.next_id.fetch_add(1, Ordering::Relaxed);
         start.set_id(mapped);
-        self.inner.insert(start.id(), MessageInfo::new(self.src, start.clone(), mapped));
+        self.inner.insert(orig, MessageInfo::new(self.src, start.clone(), mapped));
         Ok(())
     }
     pub fn translate_segment(&mut self, segment: &mut MessageSegment) -> Result<(), Error> {

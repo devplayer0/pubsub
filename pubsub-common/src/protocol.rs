@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::str;
 use std::collections::LinkedList;
+use std::sync::{Arc, Mutex, Condvar};
 use std::time::Instant;
 use std::net::{SocketAddr, UdpSocket};
 
@@ -245,9 +246,13 @@ pub struct Jqtt {
     timers_client: TimerManagerClient,
 
     send_buffer: LinkedList<Bytes>,
-    send_buffer_sseq: u8,
+    send_window: LinkedList<Bytes>,
+    send_window_sseq: u8,
     send_seq: u8,
     ack_timeout: Option<Timer>,
+    next_pid: usize,
+    acked_pid: Arc<(Mutex<usize>, Condvar)>,
+    send_space: Arc<(Mutex<usize>, Condvar)>,
 
     recv_seq: u8,
 }
@@ -272,71 +277,116 @@ impl Jqtt {
             timers_client,
 
             send_buffer: LinkedList::new(),
-            send_buffer_sseq: 0,
+            send_window: LinkedList::new(),
+            send_window_sseq: 0,
             send_seq: 0,
             ack_timeout: None,
+            next_pid: 1,
+            acked_pid: Arc::new((Mutex::new(0), Condvar::new())),
+            send_space: Arc::new((Mutex::new(WINDOW_SIZE as usize + SEND_BUFFER_SIZE), Condvar::new())),
 
             recv_seq: 0,
         }
     }
 
+    pub fn max_packet_size(&self) -> usize {
+        util::max_packet_size(self.addr)
+    }
     pub fn send_seq(&self) -> u8 {
         self.send_seq
     }
     pub fn handle_ack_timeout(&mut self) -> Result<(), Error> {
         self.check_ack_timeout();
         {
-            let mut iter = self.send_buffer.iter();
-            for _ in 0..cmp::min(self.send_buffer.len(), WINDOW_SIZE as usize) {
-                self.socket.send_to(iter.next().unwrap(), self.addr)?;
+            let mut iter = self.send_window.iter();
+            for _ in 0..self.send_window.len() {
+                let data = iter.next().unwrap();
+                self.socket.send_to(data, self.addr)?;
             }
         }
 
         Ok(())
     }
     fn check_ack_timeout(&mut self) {
-        if !self.send_buffer.is_empty() && (self.ack_timeout.is_none() || (self.ack_timeout.is_some() && self.timers.expired(self.ack_timeout.unwrap()))) {
+        if !self.send_window.is_empty() && (self.ack_timeout.is_none() || (self.ack_timeout.is_some() && self.timers.expired(self.ack_timeout.unwrap()))) {
             self.ack_timeout = Some(self.timers.post_message(self.timers_client, Timeout::Ack(self.addr), Instant::now() + ACK_TIMEOUT));
         }
     }
+    #[inline]
+    fn window_full(&self) -> bool {
+        self.send_window.len() >= WINDOW_SIZE as usize
+    }
     pub fn handle_ack(&mut self, seq: u8) -> Result<(), Error> {
-        if !seq_in_window(self.send_buffer_sseq, seq) || slide_amount(self.send_buffer_sseq, seq) as usize > self.send_buffer.len() {
-            return Err(Error::InvalidAck(self.send_buffer_sseq, cmp::min(WINDOW_SIZE as usize, self.send_buffer.len()) as u8, seq));
+        let slide = slide_amount(self.send_window_sseq, seq) as usize;
+        if !seq_in_window(self.send_window_sseq, seq) || slide > self.send_window.len() {
+            return Err(Error::InvalidAck(self.send_window_sseq, cmp::min(WINDOW_SIZE as usize, self.send_window.len()) as u8, seq));
         }
 
-        let split_amount = cmp::min(slide_amount(self.send_buffer_sseq, seq) as usize, self.send_buffer.len());
-        self.send_buffer = self.send_buffer.split_off(split_amount);
-
-        self.send_buffer_sseq = next_seq(seq);
-        self.send_seq = self.send_buffer_sseq;
+        self.send_window = self.send_window.split_off(slide);
+        self.send_window_sseq = next_seq(seq);
         if let Some(timer) = self.ack_timeout {
             self.timers.cancel_message(timer);
         }
+        self.check_ack_timeout();
 
-        self.handle_ack_timeout()
-    }
-    #[inline]
-    pub fn window_full(&self) -> bool {
-        self.send_buffer.len() >= WINDOW_SIZE as usize
+        if !self.send_buffer.is_empty() {
+            let buf_size = self.send_buffer.len();
+            let new_send_buf = self.send_buffer.split_off(cmp::min(slide, buf_size));
+
+            for data in &self.send_buffer {
+                self.socket.send_to(data, self.addr)?;
+            }
+            self.send_window.append(&mut self.send_buffer);
+            assert!(self.send_window.len() <= WINDOW_SIZE as usize);
+            self.send_buffer = new_send_buf;
+
+        }
+
+        {
+            let &(ref lock, ref cvar) = &*self.acked_pid;
+            let mut acked = lock.lock().unwrap();
+            *acked = acked.wrapping_add(slide);
+            cvar.notify_all();
+        }
+        self.refresh_send_space();
+        Ok(())
     }
     #[inline]
     pub fn send_buffer_full(&self) -> bool {
         self.send_buffer.len() == SEND_BUFFER_SIZE
     }
-    pub fn gbn_send(&mut self, data: Bytes) -> Result<bool, Error> {
-        assert!(data.len() <= util::max_packet_size(self.addr));
-        if self.send_buffer_full() {
+    pub fn gbn_send(&mut self, data: Bytes) -> Result<usize, Error> {
+        assert!(data.len() <= self.max_packet_size());
+        if self.window_full() && self.send_buffer_full() {
             return Err(Error::SendBufferFull);
         }
 
-        self.send_buffer.push_back(data);
         self.send_seq = next_seq(self.send_seq);
         if !self.window_full() {
-            self.socket.send_to(self.send_buffer.back().unwrap(), self.addr)?;
+            self.send_window.push_back(data);
+            self.socket.send_to(self.send_window.back().unwrap(), self.addr)?;
             self.check_ack_timeout();
+        } else {
+            self.send_buffer.push_back(data);
         }
+        self.refresh_send_space();
 
-        Ok(self.window_full())
+        let pid = self.next_pid;
+        self.next_pid = pid.wrapping_add(1);
+        Ok(pid)
+    }
+    #[inline]
+    fn refresh_send_space(&self) {
+        let &(ref lock, ref cvar) = &*self.send_space;
+        let mut space = lock.lock().unwrap();
+        *space = WINDOW_SIZE as usize + SEND_BUFFER_SIZE - self.send_window.len() - self.send_buffer.len();
+        cvar.notify_all();
+    }
+    pub fn ack_condvar(&self) -> Arc<(Mutex<usize>, Condvar)> {
+        Arc::clone(&self.acked_pid)
+    }
+    pub fn send_space_condvar(&self) -> Arc<(Mutex<usize>, Condvar)> {
+        Arc::clone(&self.send_space)
     }
 
     fn recv_slide(&mut self, seq: u8) -> Result<(), Error> {
@@ -444,34 +494,30 @@ impl Jqtt {
         self.gbn_send(bytes.freeze())?;
         Ok(())
     }
-    pub fn send_subscribe(&mut self, topic: &str) -> Result<(), Error> {
+    pub fn send_subscribe(&mut self, topic: &str) -> Result<usize, Error> {
         let topic = topic.as_bytes();
         assert!(topic.len() <= MAX_TOPIC_LENGTH);
 
         let mut data = self.buf_source.allocate(1 + topic.len());
         data.put_u8(Packet::encode_header(PacketType::Subscribe, self.send_seq));
         data.put(topic);
-        self.gbn_send(data.freeze())?;
-        Ok(())
+        self.gbn_send(data.freeze())
     }
-    pub fn send_unsubscribe(&mut self, topic: &str) -> Result<(), Error> {
+    pub fn send_unsubscribe(&mut self, topic: &str) -> Result<usize, Error> {
         let topic = topic.as_bytes();
         assert!(topic.len() <= MAX_TOPIC_LENGTH);
 
         let mut data = self.buf_source.allocate(1 + topic.len());
         data.put_u8(Packet::encode_header(PacketType::Unsubscribe, self.send_seq));
         data.put(topic);
-        self.gbn_send(data.freeze())?;
-        Ok(())
+        self.gbn_send(data.freeze())
     }
-    pub fn send_msg_start(&mut self, start: &MessageStart) -> Result<(), Error> {
+    pub fn send_msg_start(&mut self, start: &MessageStart) -> Result<usize, Error> {
         let data = start.with_seq(&self.buf_source, self.send_seq());
-        self.gbn_send(data)?;
-        Ok(())
+        self.gbn_send(data)
     }
-    pub fn send_msg_segment(&mut self, segment: &MessageSegment) -> Result<(), Error> {
+    pub fn send_msg_segment(&mut self, segment: &MessageSegment) -> Result<usize, Error> {
         let data = segment.with_seq(&self.buf_source, self.send_seq());
-        self.gbn_send(data)?;
-        Ok(())
+        self.gbn_send(data)
     }
 }
