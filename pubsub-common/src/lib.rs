@@ -1,5 +1,6 @@
 #![feature(euclidean_division)]
 #![feature(try_from)]
+#![feature(wait_until, wait_timeout_until)]
 
 use std::str::{self, Utf8Error};
 use std::io;

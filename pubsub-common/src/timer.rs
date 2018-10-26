@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Condvar};
 use std::sync::atomic::{AtomicUsize, AtomicBool};
 use std::sync::atomic::Ordering as AtOrdering;
 use std::thread::{self, JoinHandle};
@@ -9,6 +9,15 @@ use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use priority_queue::PriorityQueue;
+
+macro_rules! wake_thread {
+    ($cvar:expr) => {{
+        let &(ref lock, ref cvar) = &*$cvar;
+        let mut woke = lock.lock().unwrap();
+        *woke = true;
+        cvar.notify_one();
+    }};
+}
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 struct ReverseInstant(Instant);
@@ -76,7 +85,7 @@ pub struct TimerManager<M: Send + Eq + Hash + 'static> {
 
     thread: Arc<JoinHandle<()>>,
     running: Arc<Mutex<bool>>,
-    wakeup_tx: mpsc::SyncSender<()>,
+    wakeup: Arc<(Mutex<bool>, Condvar)>,
 }
 impl<M: Send + Eq + Hash + 'static> Clone for TimerManager<M> {
     fn clone(&self) -> TimerManager<M> {
@@ -89,7 +98,7 @@ impl<M: Send + Eq + Hash + 'static> Clone for TimerManager<M> {
 
             thread: Arc::clone(&self.thread),
             running: Arc::clone(&self.running),
-            wakeup_tx: self.wakeup_tx.clone(),
+            wakeup: Arc::clone(&self.wakeup),
         }
     }
 }
@@ -99,18 +108,21 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         let clients: Arc<RwLock<HashMap<_, Sender<M>>>> = Arc::new(RwLock::new(HashMap::new()));
         let timers: Arc<Mutex<PriorityQueue<TimerInfo<M>, ReverseInstant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
         let timers_map = Arc::new(RwLock::new(HashMap::new()));
-        let (wakeup_tx, wakeup_rx) = mpsc::sync_channel(0);
+
+        let wakeup = Arc::new((Mutex::new(false), Condvar::new()));
         let thread = Arc::new({
             let running_lock = Arc::clone(&running);
             let clients = Arc::clone(&clients);
             let timers = Arc::clone(&timers);
             let timers_map = Arc::clone(&timers_map);
+
+            let wakeup = Arc::clone(&wakeup);
             thread::spawn(move || {
                 while *running_lock.lock().unwrap() {
                     if timers.lock().unwrap().is_empty() {
-                        if let Err(_) = wakeup_rx.recv() {
-                            break;
-                        }
+                        let &(ref lock, ref cvar) = &*wakeup;
+                        let mut woke = cvar.wait_until(lock.lock().unwrap(), |&mut woke| woke).unwrap();
+                        *woke = false;
                         continue;
                     }
                     let (time, cancelled) = {
@@ -128,14 +140,14 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
                         timers_map.write().unwrap().remove(&timer.id);
                         clients.read().unwrap()[&timer.client].send(timer.message);
                     } else {
-                        match wakeup_rx.recv_timeout(time - Instant::now()) {
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let &(ref lock, ref cvar) = &*wakeup;
+                        match cvar.wait_timeout_until(lock.lock().unwrap(), time - Instant::now(), |&mut woke| woke).unwrap() {
+                            (_, timeout) if timeout.timed_out() => {
                                 let (timer, _) = timers.lock().unwrap().pop().unwrap();
                                 timers_map.write().unwrap().remove(&timer.id);
                                 clients.read().unwrap()[&timer.client].send(timer.message);
                             },
-                            Ok(_) => {},
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            (ref mut woke, _) => **woke = false,
                         }
                     }
                 }
@@ -151,7 +163,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
 
             thread,
             running,
-            wakeup_tx,
+            wakeup,
         }
     }
 
@@ -170,7 +182,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         self.timers_map.write().unwrap().insert(id, Arc::clone(&info.cancelled));
         self.timers.lock().unwrap().push(info, when.into());
 
-        self.wakeup_tx.send(()).unwrap();
+        wake_thread!(self.wakeup);
         Timer(id)
     }
     pub fn expired(&self, timer: Timer) -> bool {
@@ -192,7 +204,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         if !found {
             return false;
         }
-        self.wakeup_tx.send(()).unwrap();
+        wake_thread!(self.wakeup);
         true
     }
 
@@ -202,7 +214,7 @@ impl<M: Send + Eq + Hash + 'static> TimerManager<M> {
         }
 
         *self.running.lock().unwrap() = false;
-        let _ = self.wakeup_tx.send(());
+        wake_thread!(self.wakeup);
         Arc::try_unwrap(self.thread).unwrap().join().unwrap();
     }
 }
