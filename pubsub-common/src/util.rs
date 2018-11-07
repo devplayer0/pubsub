@@ -42,11 +42,7 @@ impl BufferProvider {
     pub fn allocate(&self, size: usize) -> BytesMut {
         let mut buffer = self.buffer.lock().unwrap();
         if buffer.capacity() < cmp::max(size, self.lo) {
-            let ptr = buffer.as_ptr();
             buffer.reserve(cmp::max(size, self.hi));
-            if buffer.as_ptr() != ptr {
-                debug!("buffer realloc");
-            }
         }
 
         buffer.split_to(size)

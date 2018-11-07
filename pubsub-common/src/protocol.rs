@@ -14,7 +14,7 @@ use crossbeam_channel::Sender;
 use ::Error;
 use constants::*;
 use util::{self, BufferProvider};
-use timer::{Timer, TimerManager, TimerManagerClient};
+use timer::{Timer, TimerManager};
 use packet::{Packet, PacketType};
 
 #[inline]
@@ -204,25 +204,25 @@ pub enum Timeout {
 #[derive(Debug)]
 pub struct KeepaliveManager {
     timers: TimerManager<Timeout>,
-    timers_client: TimerManagerClient,
     addr: SocketAddr,
 
-    timer: Timer,
+    timer: Timer<Timeout>,
 }
 impl Drop for KeepaliveManager {
     fn drop(&mut self) {
-        self.timers.cancel_message(self.timer);
-        self.timers.unregister(self.timers_client);
+        self.timers.cancel(&self.timer);
     }
 }
 impl KeepaliveManager {
     pub fn new(timers: &TimerManager<Timeout>, timeout_tx: &Sender<Timeout>, addr: SocketAddr) -> KeepaliveManager {
-        let timers_client = timers.register(timeout_tx);
-        let timer = timers.post_message(timers_client, Timeout::Keepalive(addr), Instant::now() + KEEPALIVE_TIMEOUT);
+        let callback = {
+            let timeout_tx = timeout_tx.clone();
+            move |msg| timeout_tx.send(msg)
+        };
+        let timer = timers.post_new(Timeout::Keepalive(addr), callback, Instant::now() + KEEPALIVE_TIMEOUT);
 
         KeepaliveManager {
             timers: timers.clone(),
-            timers_client,
             addr,
 
             timer,
@@ -230,8 +230,10 @@ impl KeepaliveManager {
     }
 
     pub fn heartbeat(&mut self) {
-        self.timers.cancel_message(self.timer);
-        self.timer = self.timers.post_message(self.timers_client, Timeout::Keepalive(self.addr), Instant::now() + KEEPALIVE_TIMEOUT);
+        if !self.timer.has_message() {
+            self.timer.set_message(Timeout::Keepalive(self.addr));
+        }
+        self.timers.reschedule(&self.timer, Instant::now() + KEEPALIVE_TIMEOUT);
     }
 }
 
@@ -243,13 +245,11 @@ pub struct Jqtt {
     addr: SocketAddr,
     socket: UdpSocket,
 
-    timers_client: TimerManagerClient,
-
     send_buffer: LinkedList<Bytes>,
     send_window: LinkedList<Bytes>,
     send_window_sseq: u8,
     send_seq: u8,
-    ack_timeout: Option<Timer>,
+    ack_timeout: Timer<Timeout>,
     next_pid: usize,
     acked_pid: Arc<(Mutex<usize>, Condvar)>,
     send_space: Arc<(Mutex<usize>, Condvar)>,
@@ -258,15 +258,15 @@ pub struct Jqtt {
 }
 impl Drop for Jqtt {
     fn drop(&mut self) {
-        if let Some(timer) = self.ack_timeout {
-            self.timers.cancel_message(timer);
-        }
-        self.timers.unregister(self.timers_client);
+        self.timers.cancel(&self.ack_timeout);
     }
 }
 impl Jqtt {
     pub fn new(timers: &TimerManager<Timeout>, buf_source: &BufferProvider, addr: SocketAddr, socket: UdpSocket, timeout_tx: &Sender<Timeout>) -> Jqtt {
-        let timers_client = timers.register(&timeout_tx);
+        let callback = {
+            let timeout_tx = timeout_tx.clone();
+            move |msg| timeout_tx.send(msg)
+        };
         Jqtt {
             timers: timers.clone(),
             buf_source: buf_source.clone(),
@@ -274,13 +274,11 @@ impl Jqtt {
             addr,
             socket,
 
-            timers_client,
-
             send_buffer: LinkedList::new(),
             send_window: LinkedList::new(),
             send_window_sseq: 0,
             send_seq: 0,
-            ack_timeout: None,
+            ack_timeout: timers.create(Timeout::Ack(addr), callback),
             next_pid: 1,
             acked_pid: Arc::new((Mutex::new(0), Condvar::new())),
             send_space: Arc::new((Mutex::new(WINDOW_SIZE as usize + SEND_BUFFER_SIZE), Condvar::new())),
@@ -296,7 +294,7 @@ impl Jqtt {
         self.send_seq
     }
     pub fn handle_ack_timeout(&mut self) -> Result<(), Error> {
-        self.check_ack_timeout();
+        self.reset_ack_timeout();
         {
             let mut iter = self.send_window.iter();
             for _ in 0..self.send_window.len() {
@@ -307,10 +305,11 @@ impl Jqtt {
 
         Ok(())
     }
-    fn check_ack_timeout(&mut self) {
-        if !self.send_window.is_empty() && (self.ack_timeout.is_none() || (self.ack_timeout.is_some() && self.timers.expired(self.ack_timeout.unwrap()))) {
-            self.ack_timeout = Some(self.timers.post_message(self.timers_client, Timeout::Ack(self.addr), Instant::now() + ACK_TIMEOUT));
+    fn reset_ack_timeout(&self) {
+        if !self.ack_timeout.has_message() {
+            self.ack_timeout.set_message(Timeout::Ack(self.addr));
         }
+        self.timers.reschedule(&self.ack_timeout, Instant::now() + ACK_TIMEOUT);
     }
     #[inline]
     fn window_full(&self) -> bool {
@@ -324,10 +323,7 @@ impl Jqtt {
 
         self.send_window = self.send_window.split_off(slide);
         self.send_window_sseq = next_seq(seq);
-        if let Some(timer) = self.ack_timeout {
-            self.timers.cancel_message(timer);
-        }
-        self.check_ack_timeout();
+        self.reset_ack_timeout();
 
         if !self.send_buffer.is_empty() {
             let buf_size = self.send_buffer.len();
@@ -339,7 +335,7 @@ impl Jqtt {
             self.send_window.append(&mut self.send_buffer);
             assert!(self.send_window.len() <= WINDOW_SIZE as usize);
             self.send_buffer = new_send_buf;
-
+            self.reset_ack_timeout();
         }
 
         {
@@ -362,10 +358,12 @@ impl Jqtt {
         }
 
         self.send_seq = next_seq(self.send_seq);
+        if self.send_window.is_empty() {
+            self.reset_ack_timeout();
+        }
         if !self.window_full() {
             self.send_window.push_back(data);
             self.socket.send_to(self.send_window.back().unwrap(), self.addr)?;
-            self.check_ack_timeout();
         } else {
             self.send_buffer.push_back(data);
         }

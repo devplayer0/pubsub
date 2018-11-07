@@ -240,9 +240,6 @@ impl<'a> Client<'a> {
             return Err(Error::ConnectionFailed);
         }
         let keepalive = keepalive.unwrap();
-        if keepalive {
-            timeout_tx.send(Timeout::SendHeartbeat(remote));
-        }
 
         let (inner_tx, inner_rx) = channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
@@ -287,6 +284,15 @@ impl<'a> Client<'a> {
         let inner_thread = {
             let io_running = Arc::clone(&running);
 
+            let heartbeat_timer = match keepalive {
+                true => {
+                    let timeout_tx = timeout_tx.clone();
+                    Some(timers.post_new(Timeout::SendHeartbeat(remote), move |msg| {
+                        timeout_tx.send(msg);
+                    }, Instant::now()))
+                },
+                false => None,
+            };
             let keepalive = match keepalive {
                 true => Some(KeepaliveManager::new(&timers, &timeout_tx, remote)),
                 false => None,
@@ -295,7 +301,6 @@ impl<'a> Client<'a> {
             let protocol = Arc::clone(&protocol);
 
             let timers = timers.clone();
-            let timers_id = timers.register(&timeout_tx);
             thread::spawn(move || {
                 let mut running = true;
                 while running {
@@ -347,7 +352,9 @@ impl<'a> Client<'a> {
                                             running = false;
                                             inner.dispatch_error(e.into());
                                         } else {
-                                            timers.post_message(timers_id, Timeout::SendHeartbeat(remote), Instant::now() + (constants::KEEPALIVE_TIMEOUT / 2));
+                                            let timer = heartbeat_timer.as_ref().unwrap();
+                                            timer.set_message(Timeout::SendHeartbeat(remote));
+                                            timers.reschedule(timer, Instant::now() + (constants::KEEPALIVE_TIMEOUT / 2));
                                         }
                                     },
                                 }

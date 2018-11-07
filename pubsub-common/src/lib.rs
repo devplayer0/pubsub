@@ -8,6 +8,8 @@ use std::io;
 #[macro_use]
 extern crate enum_primitive;
 #[macro_use]
+extern crate debug_stub_derive;
+#[macro_use]
 extern crate quick_error;
 #[macro_use]
 extern crate log;
