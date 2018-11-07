@@ -11,7 +11,7 @@ use ::Error;
 use common::constants::*;
 use common::util::BufferProvider;
 use common::packet::{PacketType, Packet};
-use common::protocol::{MessageStart, MessageSegment};
+pub use common::protocol::{MessageStart, MessageSegment};
 
 pub trait MessageListener {
     fn recv_start(&mut self, start: MessageStart) -> Result<(), Error>;

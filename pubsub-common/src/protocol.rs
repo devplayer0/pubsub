@@ -9,7 +9,6 @@ use std::time::Instant;
 use std::net::{SocketAddr, UdpSocket};
 
 use bytes::{IntoBuf, Buf, BufMut, Bytes, BytesMut};
-use crossbeam_channel::Sender;
 
 use ::Error;
 use constants::*;
@@ -196,7 +195,6 @@ impl MessageSegment {
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum Timeout {
     Keepalive(SocketAddr),
-    SendHeartbeat(SocketAddr),
     Ack(SocketAddr),
 }
 
@@ -214,11 +212,7 @@ impl Drop for KeepaliveManager {
     }
 }
 impl KeepaliveManager {
-    pub fn new(timers: &TimerManager<Timeout>, timeout_tx: &Sender<Timeout>, addr: SocketAddr) -> KeepaliveManager {
-        let callback = {
-            let timeout_tx = timeout_tx.clone();
-            move |msg| timeout_tx.send(msg)
-        };
+    pub fn new<C: FnMut(Timeout) + Send + Sync + 'static>(timers: &TimerManager<Timeout>, callback: C, addr: SocketAddr) -> KeepaliveManager {
         let timer = timers.post_new(Timeout::Keepalive(addr), callback, Instant::now() + KEEPALIVE_TIMEOUT);
 
         KeepaliveManager {
@@ -262,11 +256,7 @@ impl Drop for Jqtt {
     }
 }
 impl Jqtt {
-    pub fn new(timers: &TimerManager<Timeout>, buf_source: &BufferProvider, addr: SocketAddr, socket: UdpSocket, timeout_tx: &Sender<Timeout>) -> Jqtt {
-        let callback = {
-            let timeout_tx = timeout_tx.clone();
-            move |msg| timeout_tx.send(msg)
-        };
+    pub fn new<C: FnMut(Timeout) + Send + Sync + 'static>(timers: &TimerManager<Timeout>, buf_source: &BufferProvider, addr: SocketAddr, socket: UdpSocket, timeout_callback: C) -> Jqtt {
         Jqtt {
             timers: timers.clone(),
             buf_source: buf_source.clone(),
@@ -278,7 +268,7 @@ impl Jqtt {
             send_window: LinkedList::new(),
             send_window_sseq: 0,
             send_seq: 0,
-            ack_timeout: timers.create(Timeout::Ack(addr), callback),
+            ack_timeout: timers.create(Timeout::Ack(addr), timeout_callback),
             next_pid: 1,
             acked_pid: Arc::new((Mutex::new(0), Condvar::new())),
             send_space: Arc::new((Mutex::new(WINDOW_SIZE as usize + SEND_BUFFER_SIZE), Condvar::new())),

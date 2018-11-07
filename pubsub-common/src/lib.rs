@@ -1,5 +1,4 @@
 #![feature(euclidean_division)]
-#![feature(try_from)]
 #![feature(wait_until, wait_timeout_until)]
 
 use std::str::{self, Utf8Error};
@@ -14,7 +13,6 @@ extern crate quick_error;
 #[macro_use]
 extern crate log;
 extern crate bytes;
-extern crate crossbeam_channel;
 extern crate priority_queue;
 
 pub mod util;

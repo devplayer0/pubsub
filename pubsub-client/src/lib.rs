@@ -13,20 +13,18 @@ extern crate debug_stub_derive;
 #[macro_use]
 extern crate log;
 extern crate bytes;
-#[macro_use]
-extern crate crossbeam_channel;
+extern crate crossbeam;
 
 extern crate pubsub_common as common;
 
 use bytes::{BufMut, Bytes};
-use crossbeam_channel as channel;
-use channel::Sender;
+use crossbeam::queue::MsQueue;
 
 use common::constants;
 use common::util::{self, BufferProvider};
 pub use common::timer::TimerManager;
 use common::packet::{PacketType, Packet};
-use common::protocol::{Timeout, KeepaliveManager, Jqtt};
+use common::protocol::{self, KeepaliveManager, Jqtt};
 
 pub mod messaging;
 pub use messaging::{Message, MessageListener, MessageCollector, CompleteMessageListener};
@@ -115,8 +113,15 @@ quick_error! {
 
 enum InternalMessage {
     Packet(Bytes),
+    Timeout(protocol::Timeout),
     IoError(io::Error),
+    SendHeartbeat,
     Shutdown,
+}
+impl From<protocol::Timeout> for InternalMessage {
+    fn from(timeout: protocol::Timeout) -> Self {
+        InternalMessage::Timeout(timeout)
+    }
 }
 
 struct ClientInner<M: MessageListener + Send> {
@@ -175,7 +180,8 @@ pub struct Client<'a> {
 
     running: Arc<AtomicBool>,
     io_thread: JoinHandle<()>,
-    inner_tx: Sender<InternalMessage>,
+    #[debug_stub = "Arc<MsQueue<InternalMessage>>"]
+    queue: Arc<MsQueue<InternalMessage>>,
     inner_thread: JoinHandle<()>,
 
     acked_pid: Arc<(Mutex<usize>, Condvar)>,
@@ -207,14 +213,18 @@ impl<'a> Client<'a> {
     pub fn connect<A: ToSocketAddrs, M: MessageListener + Send + Sync + 'static>(server: A, msg_listener: M) -> Result<Client<'a>, Error> {
         Client::connect_timers(&TimerManager::new(), server, msg_listener)
     }
-    pub fn connect_timers<A: ToSocketAddrs, M: MessageListener + Send + Sync + 'static>(timers: &TimerManager<Timeout>, server: A, listener: M) -> Result<Client<'a>, Error> {
+    pub fn connect_timers<A: ToSocketAddrs, M: MessageListener + Send + Sync + 'static>(timers: &TimerManager<protocol::Timeout>, server: A, listener: M) -> Result<Client<'a>, Error> {
         let (remote, socket) = Client::udp_connect(server)?;
         socket.set_read_timeout(Some(Duration::from_millis(250)))?;
 
         let buf_source = BufferProvider::new(BUFFER_PREALLOC_SIZE, util::max_packet_size(remote));
-        let (timeout_tx, timeout_rx) = channel::unbounded();
 
-        let protocol = Arc::new(Mutex::new(Jqtt::new(timers, &buf_source, remote, socket.try_clone().unwrap(), &timeout_tx)));
+        let queue = Arc::new(MsQueue::new());
+        let protocol = {
+            let queue = Arc::clone(&queue);
+            let callback = move |msg: protocol::Timeout| queue.push(msg.into());
+            Arc::new(Mutex::new(Jqtt::new(timers, &buf_source, remote, socket.try_clone().unwrap(), callback)))
+        };
         let mut keepalive = None;
         for _ in 0..constants::CONNECT_RETRIES {
             let mut protocol = protocol.lock().unwrap();
@@ -241,12 +251,11 @@ impl<'a> Client<'a> {
         }
         let keepalive = keepalive.unwrap();
 
-        let (inner_tx, inner_rx) = channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
         let io_thread = {
             let running = Arc::clone(&running);
             let buf_source = buf_source.clone();
-            let inner_tx = inner_tx.clone();
+            let queue = Arc::clone(&queue);
 
             let (acked_pid, send_space) = {
                 let protocol = protocol.lock().unwrap();
@@ -261,7 +270,7 @@ impl<'a> Client<'a> {
                             Ok(size) => size,
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                             Err(e) => {
-                                inner_tx.send(InternalMessage::IoError(e));
+                                queue.push(InternalMessage::IoError(e));
                                 running.store(false, Ordering::SeqCst);
                                 break;
                             }
@@ -271,7 +280,7 @@ impl<'a> Client<'a> {
                     };
 
                     packet_buffer.truncate(size);
-                    inner_tx.send(InternalMessage::Packet(packet_buffer.freeze()));
+                    queue.push(InternalMessage::Packet(packet_buffer.freeze()));
                 }
 
                 let &(ref _lock, ref cvar) = &*send_space;
@@ -282,84 +291,73 @@ impl<'a> Client<'a> {
         };
 
         let inner_thread = {
-            let io_running = Arc::clone(&running);
-
             let heartbeat_timer = match keepalive {
                 true => {
-                    let timeout_tx = timeout_tx.clone();
-                    Some(timers.post_new(Timeout::SendHeartbeat(remote), move |msg| {
-                        timeout_tx.send(msg);
-                    }, Instant::now()))
+                    let queue = Arc::clone(&queue);
+                    Some(timers.post_new(protocol::Timeout::Keepalive(remote), move |_| queue.push(InternalMessage::SendHeartbeat), Instant::now()))
                 },
                 false => None,
             };
             let keepalive = match keepalive {
-                true => Some(KeepaliveManager::new(&timers, &timeout_tx, remote)),
+                true => {
+                    let queue = Arc::clone(&queue);
+                    Some(KeepaliveManager::new(&timers, move |msg| queue.push(msg.into()), remote))
+                },
                 false => None,
             };
-            let mut inner = ClientInner::new(remote, &protocol, listener, keepalive);
-            let protocol = Arc::clone(&protocol);
 
+            let mut inner = ClientInner::new(remote, &protocol, listener, keepalive);
+            let queue = Arc::clone(&queue);
+            let io_running = Arc::clone(&running);
+            let protocol = Arc::clone(&protocol);
             let timers = timers.clone();
             thread::spawn(move || {
                 let mut running = true;
                 while running {
-                    select! {
-                        recv(inner_rx, msg) => {
-                            if let Some(msg) = msg {
-                                match msg {
-                                    InternalMessage::Packet(data) => if let Err(e) = inner.handle(&data) {
-                                        io_running.store(false, Ordering::SeqCst);
-                                        running = false;
-                                        inner.dispatch_error(e);
-                                    },
-                                    InternalMessage::IoError(e) => {
-                                        inner.dispatch_error(e.into());
-                                        if let Err(e) = protocol.lock().unwrap().send_disconnect() {
-                                            inner.dispatch_error(e.into());
-                                        }
-                                        running = false;
-                                    },
-                                    InternalMessage::Shutdown => {
-                                        if let Err(e) = protocol.lock().unwrap().send_disconnect() {
-                                            inner.dispatch_error(e.into());
-                                        }
-                                        running = false;
-                                    },
-                                }
+                    match queue.pop() {
+                        InternalMessage::Packet(data) => if let Err(e) = inner.handle(&data) {
+                            io_running.store(false, Ordering::SeqCst);
+                            running = false;
+                            inner.dispatch_error(e);
+                        },
+                        InternalMessage::Timeout(protocol::Timeout::Ack(_)) => {
+                            warn!("server ack timed out, re-sending packets in window");
+                            if let Err(e) = protocol.lock().unwrap().handle_ack_timeout() {
+                                error!("error while handling ack timeout: {}", e);
                             }
                         },
-                        recv(timeout_rx, msg) => {
-                            if let Some(msg) = msg {
-                                match msg {
-                                    Timeout::Ack(_) => {
-                                        warn!("server ack timed out, re-sending packets in window");
-                                        if let Err(e) = protocol.lock().unwrap().handle_ack_timeout() {
-                                            error!("error while handling ack timeout: {}", e);
-                                        }
-                                    },
-                                    Timeout::Keepalive(_) => {
-                                        error!("server timed out, disconnecting...");
-                                        io_running.store(false, Ordering::SeqCst);
-                                        if let Err(e) = protocol.lock().unwrap().send_disconnect() {
-                                            inner.dispatch_error(e.into());
-                                        }
-                                        running = false;
-                                    }
-                                    Timeout::SendHeartbeat(_) => {
-                                        if let Err(e) = protocol.lock().unwrap().send_heartbeat() {
-                                            io_running.store(false, Ordering::SeqCst);
-                                            running = false;
-                                            inner.dispatch_error(e.into());
-                                        } else {
-                                            let timer = heartbeat_timer.as_ref().unwrap();
-                                            timer.set_message(Timeout::SendHeartbeat(remote));
-                                            timers.reschedule(timer, Instant::now() + (constants::KEEPALIVE_TIMEOUT / 2));
-                                        }
-                                    },
-                                }
+                        InternalMessage::Timeout(protocol::Timeout::Keepalive(_)) => {
+                            error!("server timed out, disconnecting...");
+                            io_running.store(false, Ordering::SeqCst);
+                            if let Err(e) = protocol.lock().unwrap().send_disconnect() {
+                                inner.dispatch_error(e.into());
                             }
-                        }
+                            running = false;
+                        },
+                        InternalMessage::IoError(e) => {
+                            inner.dispatch_error(e.into());
+                            if let Err(e) = protocol.lock().unwrap().send_disconnect() {
+                                inner.dispatch_error(e.into());
+                            }
+                            running = false;
+                        },
+                        InternalMessage::Shutdown => {
+                            if let Err(e) = protocol.lock().unwrap().send_disconnect() {
+                                inner.dispatch_error(e.into());
+                            }
+                            running = false;
+                        },
+                        InternalMessage::SendHeartbeat => {
+                            if let Err(e) = protocol.lock().unwrap().send_heartbeat() {
+                                io_running.store(false, Ordering::SeqCst);
+                                running = false;
+                                inner.dispatch_error(e.into());
+                            } else {
+                                let timer = heartbeat_timer.as_ref().unwrap();
+                                timer.set_message(protocol::Timeout::Keepalive(remote));
+                                timers.reschedule(timer, Instant::now() + (constants::KEEPALIVE_TIMEOUT / 2));
+                            }
+                        },
                     }
                 }
             })
@@ -375,7 +373,7 @@ impl<'a> Client<'a> {
 
             running,
             io_thread,
-            inner_tx,
+            queue,
             inner_thread,
 
             acked_pid,
@@ -388,7 +386,7 @@ impl<'a> Client<'a> {
         self.running.store(false, Ordering::SeqCst);
         self.io_thread.join().unwrap();
 
-        self.inner_tx.send(InternalMessage::Shutdown);
+        self.queue.push(InternalMessage::Shutdown);
         self.inner_thread.join().unwrap();
     }
 

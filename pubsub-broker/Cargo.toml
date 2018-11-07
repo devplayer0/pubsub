@@ -9,6 +9,6 @@ log = "~0.4"
 simplelog = "~0.5"
 bytes = "~0.4"
 num_cpus = "~1.8"
-crossbeam-channel = "~0.2"
+crossbeam = "~0.4"
 ctrlc = { version = "~3.0", features = [ "termination" ] }
 pubsub-common = { path = "../pubsub-common" }

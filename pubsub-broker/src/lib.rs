@@ -17,14 +17,12 @@ extern crate quick_error;
 extern crate log;
 extern crate bytes;
 extern crate num_cpus;
-#[macro_use]
-extern crate crossbeam_channel;
+extern crate crossbeam;
 
 extern crate pubsub_common as common;
 
 use bytes::{BufMut, Bytes};
-use crossbeam_channel as channel;
-use crossbeam_channel::{Sender, Receiver};
+use crossbeam::queue::MsQueue;
 
 use common::constants;
 use common::util::{self, BufferProvider};
@@ -100,8 +98,7 @@ struct WorkerManager {
     workers: Vec<Worker>,
 
     next_message_id: Arc<AtomicU32>,
-    client_assignments: HashMap<SocketAddr, Sender<WorkerMessage>>,
-    disconnect_rx: Receiver<WorkerMessage>,
+    client_assignments: Arc<RwLock<HashMap<SocketAddr, Arc<MsQueue<WorkerMessage>>>>>,
 }
 impl WorkerManager {
     pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool) -> WorkerManager {
@@ -109,13 +106,12 @@ impl WorkerManager {
         info!("creating {} workers...", worker_count);
 
         let mut workers = Vec::with_capacity(worker_count);
-        let worker_txs = Arc::new(RwLock::new(Vec::with_capacity(worker_count)));
-        let (disconnect_tx, disconnect_rx) = channel::unbounded();
+        let worker_queues = Arc::new(RwLock::new(Vec::with_capacity(worker_count)));
+        let client_assignments = Arc::new(RwLock::new(HashMap::new()));
 
         for _ in 0..worker_count {
-            let worker = Worker::new(&worker_txs, &disconnect_tx);
-            let (worker_tx, _) = worker.tx();
-            worker_txs.write().unwrap().push(worker_tx);
+            let worker = Worker::new(&worker_queues, &client_assignments);
+            worker_queues.write().unwrap().push(worker.queue());
             workers.push(worker);
         }
 
@@ -129,8 +125,7 @@ impl WorkerManager {
             next_worker: AtomicUsize::new(0),
 
             next_message_id: Arc::new(AtomicU32::new(0)),
-            client_assignments: HashMap::new(),
-            disconnect_rx,
+            client_assignments,
         }
     }
 
@@ -143,26 +138,22 @@ impl WorkerManager {
         worker
     }
     pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Bytes) {
-        while !self.disconnect_rx.is_empty() {
-            match self.disconnect_rx.recv().unwrap() {
-                WorkerMessage::Disconnect(client) => { debug!("removing client assignment {}", client); self.client_assignments.remove(&client).unwrap(); },
-                _ => panic!("impossible"),
+        {
+            if let Some(queue) = self.client_assignments.read().unwrap().get(&client_addr) {
+                queue.push(WorkerMessage::Packet(client_addr, data));
+                return;
             }
         }
 
-        if !self.client_assignments.contains_key(&client_addr) {
-            let tx = {
-                let worker = self.next_worker();
-                let (tx, timeout_tx) = worker.tx();
-                let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, &timeout_tx, self.use_heartbeats, &self.next_message_id);
-                worker.assign(client);
-                tx
-            };
-
-            self.client_assignments.insert(client_addr, tx);
-        }
-
-        self.client_assignments[&client_addr].send(WorkerMessage::Packet(client_addr, data));
+        let queue = {
+            let worker = self.next_worker();
+            let queue = worker.queue();
+            let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, &queue, self.use_heartbeats, &self.next_message_id);
+            worker.assign(client);
+            queue
+        };
+        queue.push(WorkerMessage::Packet(client_addr, data));
+        self.client_assignments.write().unwrap().insert(client_addr, queue);
     }
     pub fn stop(self) {
         for worker in self.workers {

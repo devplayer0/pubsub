@@ -7,14 +7,16 @@ use std::sync::atomic::{Ordering, AtomicU32};
 use std::net::{SocketAddr, UdpSocket};
 
 use bytes::Bytes;
-use crossbeam_channel::Sender;
+use crossbeam::queue::MsQueue;
 
 use common;
 use common::util::BufferProvider;
 use common::timer::TimerManager;
 use common::packet::{PacketType, Packet};
 use common::protocol::{Jqtt, Timeout, KeepaliveManager, MessageStart, MessageSegment};
+
 use ::Error;
+use worker::WorkerMessage;
 
 #[derive(Debug)]
 pub enum Action<'a> {
@@ -140,15 +142,20 @@ impl DerefMut for Client {
     }
 }
 impl Client {
-    pub fn new(timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_tx: &Sender<Timeout>, keepalive: bool, next_message_id: &Arc<AtomicU32>) -> Client {
+    pub fn new(timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_queue: &Arc<MsQueue<WorkerMessage>>, keepalive: bool, next_message_id: &Arc<AtomicU32>) -> Client {
         let keepalive = match keepalive {
-            true => Some(KeepaliveManager::new(timers, timeout_tx, addr)),
+            true => {
+                let queue = Arc::clone(timeout_queue);
+                Some(KeepaliveManager::new(timers, move |msg| queue.push(msg.into()), addr))
+            },
             false => None
         };
 
+        let timeout_queue = timeout_queue.clone();
+        let timeout_callback = move |msg: Timeout| timeout_queue.push(msg.into());
         Client {
             addr,
-            protocol: Jqtt::new(timers, buf_source, addr, socket, timeout_tx),
+            protocol: Jqtt::new(timers, buf_source, addr, socket, timeout_callback),
             buf_source: buf_source.clone(),
 
             keepalive,
