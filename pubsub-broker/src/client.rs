@@ -103,10 +103,15 @@ impl MessageMapping {
             return Err(Error::PublishNotStarted(self.src, segment.id()));
         }
 
-        let info = self.inner.get_mut(&segment.id()).unwrap();
-        info.dispatched(segment.len() as u32)?;
-        segment.link_start(&info.start);
-        segment.set_id(info.mapped_id());
+        if {
+            let info = self.inner.get_mut(&segment.id()).unwrap();
+            let finished = info.dispatched(segment.len() as u32)?;
+            segment.link_start(&info.start);
+            segment.set_id(info.mapped_id());
+            finished
+        } {
+            self.inner.remove(&segment.id());
+        }
         Ok(())
     }
 }

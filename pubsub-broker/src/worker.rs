@@ -25,15 +25,18 @@ impl From<protocol::Timeout> for WorkerMessage {
 #[derive(Debug)]
 pub(crate) struct Worker {
     queue: Arc<MsQueue<WorkerMessage>>,
+    dispatch: DispatchWorker,
+
     thread: JoinHandle<()>,
 }
 impl Worker {
-    pub fn new(clients: &Clients, dispatch_queue: &Arc<MsQueue<DispatchMessage>>) -> Worker {
+    pub fn new(clients: &Clients) -> Worker {
         let queue = Arc::new(MsQueue::new());
+        let dispatch = DispatchWorker::new(clients);
         let thread = {
             let clients = clients.clone();
             let queue = Arc::clone(&queue);
-            let dispatch_queue = Arc::clone(dispatch_queue);
+            let dispatch_queue = dispatch.queue();
 
             thread::spawn(move || {
                 let mut running = true;
@@ -122,6 +125,8 @@ impl Worker {
 
         Worker {
             queue,
+            dispatch,
+
             thread,
         }
     }
@@ -130,24 +135,28 @@ impl Worker {
         Arc::clone(&self.queue)
     }
     pub fn stop(self) {
+        self.dispatch.stop();
+
         self.queue.push(WorkerMessage::Shutdown);
         self.thread.join().unwrap();
     }
 }
 
 #[derive(Debug)]
-pub enum DispatchMessage {
+enum DispatchMessage {
     Start(SocketAddr, MessageStart),
     Segment(SocketAddr, MessageSegment),
 
     Shutdown,
 }
 #[derive(Debug)]
-pub(crate) struct DispatchWorker {
+struct DispatchWorker {
+    queue: Arc<MsQueue<DispatchMessage>>,
     thread: JoinHandle<()>,
 }
 impl DispatchWorker {
-    pub fn new(clients: &Clients, queue: &Arc<MsQueue<DispatchMessage>>) -> DispatchWorker {
+    pub fn new(clients: &Clients) -> DispatchWorker {
+        let queue = Arc::new(MsQueue::new());
         let thread = {
             let clients = clients.clone();
             let queue = Arc::clone(&queue);
@@ -201,11 +210,16 @@ impl DispatchWorker {
         };
 
         DispatchWorker {
+            queue,
             thread,
         }
     }
 
-    pub fn join(self) {
+    pub fn queue(&self) -> Arc<MsQueue<DispatchMessage>> {
+        Arc::clone(&self.queue)
+    }
+    pub fn stop(self) {
+        self.queue.push(DispatchMessage::Shutdown);
         self.thread.join().unwrap();
     }
 }

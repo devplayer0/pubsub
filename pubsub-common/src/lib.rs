@@ -47,9 +47,9 @@ quick_error! {
             description("out of order packet")
             display("out of order packet seq {}, expected {}", seq, expected)
         }
-        InvalidAck(window_start: u8, window_end: u8, seq: u8) {
+        InvalidAck(window_start: u8, window_size: u8, seq: u8) {
             description("received ack outside of window")
-            display("received ack {} outside of window (start {}, end {})", seq, window_start, window_end)
+            display("received ack {} outside of window (start {}, size {})", seq, window_start, window_size)
         }
         AckFail(err: io::Error) {
             from()

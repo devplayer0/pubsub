@@ -37,7 +37,7 @@ mod client;
 mod worker;
 
 use client::Clients;
-use worker::{Worker, WorkerMessage, DispatchWorker, DispatchMessage};
+use worker::{Worker, WorkerMessage};
 
 const BUFFER_PREALLOC_SIZE: usize = 16384 * constants::IPV6_MAX_PACKET_SIZE;
 
@@ -100,32 +100,20 @@ struct WorkerManager {
     workers: Vec<Worker>,
     next_worker: usize,
 
-    dispatch_queue: Arc<MsQueue<DispatchMessage>>,
-    dispatch_workers: Vec<DispatchWorker>,
-
     clients: Clients,
 }
 impl WorkerManager {
     pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool) -> WorkerManager {
-        let threads = cmp::max(num_cpus::get() - 1, 2);
-        let worker_count = (threads / 2) + threads % 2;
+        let threads = cmp::max(num_cpus::get() - 1, 1);
+        let worker_count = cmp::max(threads / 2, 1);
         info!("creating {} workers...", worker_count);
 
         let mut workers = Vec::with_capacity(worker_count);
         let clients = Clients::new();
-        let dispatch_queue = Arc::new(MsQueue::new());
 
         for _ in 0..worker_count {
-            let worker = Worker::new(&clients, &dispatch_queue);
+            let worker = Worker::new(&clients);
             workers.push(worker);
-        }
-
-        let dispatch_worker_count = threads / 2;
-        let mut dispatch_workers = Vec::with_capacity(dispatch_worker_count);
-        info!("creating {} dispatch workers...", dispatch_worker_count);
-        for _ in 0..dispatch_worker_count {
-            let worker = DispatchWorker::new(&clients, &dispatch_queue);
-            dispatch_workers.push(worker);
         }
 
         WorkerManager {
@@ -136,9 +124,6 @@ impl WorkerManager {
             use_heartbeats,
             workers,
             next_worker: 0,
-
-            dispatch_queue,
-            dispatch_workers,
 
             clients,
         }
@@ -162,13 +147,6 @@ impl WorkerManager {
         self.clients.push(client_addr, WorkerMessage::Packet(client_addr, data));
     }
     pub fn stop(self) {
-        for _ in 0..self.dispatch_workers.len() {
-            self.dispatch_queue.push(DispatchMessage::Shutdown);
-        }
-        for worker in self.dispatch_workers {
-            worker.join();
-        }
-
         for worker in self.workers {
             worker.stop();
         }
