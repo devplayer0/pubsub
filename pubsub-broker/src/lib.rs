@@ -6,18 +6,21 @@ use std::cmp;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::thread::{self, ThreadId};
-use std::sync::atomic::{Ordering, AtomicBool, AtomicUsize, AtomicU32};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{Ordering, AtomicBool};
+use std::sync::{Arc, Mutex};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
 #[macro_use]
 extern crate quick_error;
 #[macro_use]
+extern crate debug_stub_derive;
+#[macro_use]
 extern crate log;
+extern crate evmap;
+extern crate crossbeam;
 extern crate bytes;
 extern crate num_cpus;
-extern crate crossbeam;
 
 extern crate pubsub_common as common;
 
@@ -33,7 +36,7 @@ use common::protocol::Timeout;
 mod client;
 mod worker;
 
-use client::Client;
+use client::Clients;
 use worker::{Worker, WorkerMessage};
 
 const BUFFER_PREALLOC_SIZE: usize = 16384 * constants::IPV6_MAX_PACKET_SIZE;
@@ -89,76 +92,66 @@ quick_error! {
 
 #[derive(Debug)]
 struct WorkerManager {
+    buf_source: BufferProvider,
     timers: TimerManager<Timeout>,
     sockets: HashMap<SocketAddr, UdpSocket>,
-    buf_source: BufferProvider,
 
     use_heartbeats: bool,
-    next_worker: AtomicUsize,
+    queue: Arc<MsQueue<WorkerMessage>>,
     workers: Vec<Worker>,
 
-    next_message_id: Arc<AtomicU32>,
-    client_assignments: Arc<RwLock<HashMap<SocketAddr, Arc<MsQueue<WorkerMessage>>>>>,
+    clients: Clients,
 }
 impl WorkerManager {
     pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool) -> WorkerManager {
-        let worker_count = cmp::max(num_cpus::get() - 1, 1);
+        let worker_count = 1;//cmp::max(num_cpus::get() - 1, 1);
         info!("creating {} workers...", worker_count);
 
         let mut workers = Vec::with_capacity(worker_count);
-        let worker_queues = Arc::new(RwLock::new(Vec::with_capacity(worker_count)));
-        let client_assignments = Arc::new(RwLock::new(HashMap::new()));
+        let clients = Clients::new();
+        let queue = Arc::new(MsQueue::new());
 
         for _ in 0..worker_count {
-            let worker = Worker::new(&worker_queues, &client_assignments);
-            worker_queues.write().unwrap().push(worker.queue());
+            let worker = Worker::new(&clients, &queue);
             workers.push(worker);
         }
 
         WorkerManager {
+            buf_source: buf_source.clone(),
             timers: TimerManager::new(),
             sockets: sockets.into_iter().map(|s| (s.local_addr().unwrap(), s)).collect(),
-            buf_source: buf_source.clone(),
 
             use_heartbeats,
+            queue,
             workers,
-            next_worker: AtomicUsize::new(0),
 
-            next_message_id: Arc::new(AtomicU32::new(0)),
-            client_assignments,
+            clients,
         }
     }
 
-    fn next_worker(&self) -> &Worker {
-        let worker = &self.workers[self.next_worker.fetch_add(1, Ordering::SeqCst)];
-        if self.next_worker.load(Ordering::SeqCst) == self.workers.len() {
-            self.next_worker.store(0, Ordering::SeqCst);
-        }
-
-        worker
-    }
     pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Bytes) {
-        {
-            if let Some(queue) = self.client_assignments.read().unwrap().get(&client_addr) {
-                queue.push(WorkerMessage::Packet(client_addr, data));
-                return;
-            }
+        if !self.clients.have_client(client_addr) {
+            self.clients.create(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, &self.queue, self.use_heartbeats);
         }
 
-        let queue = {
-            let worker = self.next_worker();
-            let queue = worker.queue();
-            let client = Client::new(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, &queue, self.use_heartbeats, &self.next_message_id);
-            worker.assign(client);
-            queue
-        };
-        queue.push(WorkerMessage::Packet(client_addr, data));
-        self.client_assignments.write().unwrap().insert(client_addr, queue);
+        self.queue.push(WorkerMessage::Packet(client_addr, data));
     }
     pub fn stop(self) {
-        for worker in self.workers {
-            worker.stop();
+        for _ in 0..self.workers.len() {
+            self.queue.push(WorkerMessage::Shutdown);
         }
+        for worker in self.workers {
+            worker.join();
+        }
+
+        self.clients.destroy_each::<_, ()>(|mut client| {
+            info!("disconnecting {}", client.addr());
+            if let Err(e) = client.send_disconnect() {
+                warn!("error while sending disconnect packet to {}: {}", client.addr(), e);
+            }
+            Ok(())
+        }).unwrap();
+
         self.timers.stop();
     }
 }

@@ -1,8 +1,8 @@
 use std::ops::{Deref, DerefMut};
 use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{hash_map, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{Ordering, AtomicU32};
 use std::net::{SocketAddr, UdpSocket};
 
@@ -130,6 +130,7 @@ impl PartialEq for Client {
         other.addr == self.addr
     }
 }
+impl Eq for Client {}
 impl Deref for Client {
     type Target = Jqtt;
     fn deref(&self) -> &Self::Target {
@@ -162,6 +163,7 @@ impl Client {
             msg_mapping: MessageMapping::new(addr, next_message_id),
         }
     }
+    #[inline]
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -198,4 +200,211 @@ impl Client {
         Ok(None)
     }
 }
-impl Eq for Client {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CopyWrapper<C: Copy>(C);
+impl<C: Copy> evmap::ShallowCopy for CopyWrapper<C> {
+    unsafe fn shallow_copy(&mut self) -> Self {
+        CopyWrapper(self.0)
+    }
+}
+impl<C: Copy> From<C> for CopyWrapper<C> {
+    fn from(c: C) -> Self {
+        CopyWrapper(c)
+    }
+}
+
+#[derive(DebugStub)]
+pub(crate) struct Subscriptions {
+    #[debug_stub = "evmap::ReadHandle<String, SocketAddr>"]
+    read: evmap::ReadHandle<String, CopyWrapper<SocketAddr>, (), hash_map::RandomState>,
+    #[debug_stub = "evmap::WriteHandle<String, SocketAddr>"]
+    write: Arc<Mutex<evmap::WriteHandle<String, CopyWrapper<SocketAddr>, (), hash_map::RandomState>>>,
+}
+impl Clone for Subscriptions {
+    fn clone(&self) -> Self {
+        Subscriptions {
+            read: self.read.clone(),
+            write: Arc::clone(&self.write),
+        }
+    }
+}
+impl Subscriptions {
+    pub fn new() -> Subscriptions {
+        let (read, write) = evmap::new();
+        Subscriptions {
+            read,
+            write: Arc::new(Mutex::new(write)),
+        }
+    }
+
+    pub fn with_topic_each<F: FnMut(SocketAddr) -> Result<(), E>, E>(&self, topic: &str, mut fun: F) -> Option<Result<(), E>> {
+        self.read.get_and(topic, |subs| {
+            for sub in subs {
+                let result = fun(sub.0);
+                if result.is_err() {
+                    return result;
+                }
+            }
+
+            Ok(())
+        })
+    }
+    pub fn is_subscribed(&self, topic: &str, subscriber: SocketAddr) -> bool {
+        match self.read.get_and(topic, |subs| {
+            for sub in subs {
+                if sub.0 == subscriber {
+                    return true;
+                }
+            }
+            false
+        }) {
+            Some(is) => is,
+            None => false,
+        }
+    }
+    pub fn subscribe(&self, topic: &str, subscriber: SocketAddr) -> Result<(), Error> {
+        if self.is_subscribed(topic, subscriber) {
+            return Err(Error::AlreadySubscribed(topic.to_owned(), subscriber));
+        }
+
+        let mut write = self.write.lock().unwrap();
+        write.insert(topic.to_owned(), subscriber.into());
+        write.refresh();
+        Ok(())
+    }
+    fn unsubscribe_internal(&self, topic: &str, subscriber: SocketAddr) -> bool {
+        if !self.is_subscribed(topic, subscriber) {
+            return false;
+        }
+
+        let mut write = self.write.lock().unwrap();
+        let topic = topic.to_owned();
+        match self.read.get_and(&topic, |subs| subs.len() == 1).unwrap() {
+            false => write.remove(topic, subscriber.into()),
+            true => write.empty(topic),
+        }
+
+        true
+    }
+    #[inline]
+    pub fn unsubscribe(&self, topic: &str, subscriber: SocketAddr) -> Result<(), Error> {
+        match self.unsubscribe_internal(topic, subscriber) {
+            true => {
+                self.write.lock().unwrap().refresh();
+                Ok(())
+            },
+            false => Err(Error::NotSubscribed(topic.to_owned(), subscriber)),
+        }
+    }
+
+    pub fn unsubscribe_all(&self, subscriber: SocketAddr) {
+        self.read.for_each(|topic, _| { self.unsubscribe_internal(topic, subscriber); });
+        self.write.lock().unwrap().refresh();
+    }
+}
+
+struct ClientWrapper {
+    addr: SocketAddr,
+    inner: Arc<Mutex<Client>>,
+}
+impl From<Client> for ClientWrapper {
+    fn from(client: Client) -> Self {
+        ClientWrapper {
+            addr: client.addr(),
+            inner: Arc::new(Mutex::new(client)),
+        }
+    }
+}
+impl PartialEq for ClientWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
+}
+impl Eq for ClientWrapper {}
+impl Deref for ClientWrapper {
+    type Target = Arc<Mutex<Client>>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl evmap::ShallowCopy for ClientWrapper {
+    unsafe fn shallow_copy(&mut self) -> Self {
+        ClientWrapper {
+            addr: self.addr,
+            inner: self.inner.shallow_copy(),
+        }
+    }
+}
+
+#[derive(DebugStub)]
+pub(crate) struct Clients {
+    #[debug_stub = "evmap::ReadHandle<SocketAddr, Arc<Mutex<Client>>"]
+    read: evmap::ReadHandle<SocketAddr, ClientWrapper, (), hash_map::RandomState>,
+    #[debug_stub = "evmap::WriteHandle<SocketAddr, Arc<Mutex<Client>>"]
+    write: Arc<Mutex<evmap::WriteHandle<SocketAddr, ClientWrapper, (), hash_map::RandomState>>>,
+
+    subscriptions: Subscriptions,
+    next_message_id: Arc<AtomicU32>,
+}
+impl Clone for Clients {
+    fn clone(&self) -> Self {
+        Clients {
+            read: self.read.clone(),
+            write: Arc::clone(&self.write),
+
+            subscriptions: self.subscriptions.clone(),
+            next_message_id: Arc::clone(&self.next_message_id),
+        }
+    }
+}
+impl Clients {
+    pub fn new() -> Clients {
+        let (read, write) = evmap::new();
+        Clients {
+            read,
+            write: Arc::new(Mutex::new(write)),
+
+            subscriptions: Subscriptions::new(),
+            next_message_id: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    #[inline]
+    pub fn subscriptions(&self) -> &Subscriptions {
+        &self.subscriptions
+    }
+    pub fn have_client(&self, addr: SocketAddr) -> bool {
+        self.read.contains_key(&addr)
+    }
+    pub fn create(&self, timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_queue: &Arc<MsQueue<WorkerMessage>>, keepalive: bool) {
+        let mut write = self.write.lock().unwrap();
+        write.update(addr, Client::new(timers, addr, socket, buf_source, timeout_queue, keepalive, &self.next_message_id).into());
+        write.refresh();
+    }
+    pub fn remove(&self, addr: SocketAddr) {
+        self.subscriptions.unsubscribe_all(addr);
+
+        let mut write = self.write.lock().unwrap();
+        write.empty(addr);
+        write.refresh();
+    }
+    pub fn with<F: FnOnce(MutexGuard<Client>) -> T, T>(&self, addr: SocketAddr, fun: F) -> Option<T> {
+        self.read.get_and(&addr, |list| fun(list[0].lock().unwrap()))
+    }
+
+    pub fn destroy_each<F: FnMut(MutexGuard<Client>) -> Result<(), E>, E>(self, mut fun: F) -> Result<(), E> {
+        for client in self.read.map_into::<_, Vec<_>, _>(|_, c| Arc::clone(&c[0])) {
+            let result = fun(client.lock().unwrap());
+            if result.is_err() {
+                return result;
+            }
+        }
+
+        match Arc::try_unwrap(self.write) {
+            Ok(mtx) => mtx.into_inner().unwrap().destroy(),
+            Err(e) => panic!(e),
+        }
+        Ok(())
+    }
+}
