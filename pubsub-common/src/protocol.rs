@@ -313,7 +313,7 @@ impl Jqtt {
 
         self.send_window = self.send_window.split_off(slide);
         self.send_window_sseq = next_seq(seq);
-        self.reset_ack_timeout();
+        self.timers.cancel(&self.ack_timeout);
 
         if !self.send_buffer.is_empty() {
             let buf_size = self.send_buffer.len();
