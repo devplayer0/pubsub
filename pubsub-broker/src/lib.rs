@@ -37,7 +37,7 @@ mod client;
 mod worker;
 
 use client::Clients;
-use worker::{Worker, WorkerMessage};
+use worker::{Worker, WorkerMessage, DispatchWorker, DispatchMessage};
 
 const BUFFER_PREALLOC_SIZE: usize = 16384 * constants::IPV6_MAX_PACKET_SIZE;
 
@@ -97,23 +97,35 @@ struct WorkerManager {
     sockets: HashMap<SocketAddr, UdpSocket>,
 
     use_heartbeats: bool,
-    queue: Arc<MsQueue<WorkerMessage>>,
     workers: Vec<Worker>,
+    next_worker: usize,
+
+    dispatch_queue: Arc<MsQueue<DispatchMessage>>,
+    dispatch_workers: Vec<DispatchWorker>,
 
     clients: Clients,
 }
 impl WorkerManager {
     pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool) -> WorkerManager {
-        let worker_count = 1;//cmp::max(num_cpus::get() - 1, 1);
+        let threads = cmp::max(num_cpus::get() - 1, 2);
+        let worker_count = (threads / 2) + threads % 2;
         info!("creating {} workers...", worker_count);
 
         let mut workers = Vec::with_capacity(worker_count);
         let clients = Clients::new();
-        let queue = Arc::new(MsQueue::new());
+        let dispatch_queue = Arc::new(MsQueue::new());
 
         for _ in 0..worker_count {
-            let worker = Worker::new(&clients, &queue);
+            let worker = Worker::new(&clients, &dispatch_queue);
             workers.push(worker);
+        }
+
+        let dispatch_worker_count = threads / 2;
+        let mut dispatch_workers = Vec::with_capacity(dispatch_worker_count);
+        info!("creating {} dispatch workers...", dispatch_worker_count);
+        for _ in 0..dispatch_worker_count {
+            let worker = DispatchWorker::new(&clients, &dispatch_queue);
+            dispatch_workers.push(worker);
         }
 
         WorkerManager {
@@ -122,26 +134,43 @@ impl WorkerManager {
             sockets: sockets.into_iter().map(|s| (s.local_addr().unwrap(), s)).collect(),
 
             use_heartbeats,
-            queue,
             workers,
+            next_worker: 0,
+
+            dispatch_queue,
+            dispatch_workers,
 
             clients,
         }
     }
 
-    pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Bytes) {
-        if !self.clients.have_client(client_addr) {
-            self.clients.create(&self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, &self.queue, self.use_heartbeats);
+    fn next_worker(&mut self) -> Arc<MsQueue<WorkerMessage>> {
+        let worker = self.next_worker;
+        self.next_worker = worker.wrapping_add(1);
+        if self.next_worker == self.workers.len() {
+            self.next_worker = 0;
         }
 
-        self.queue.push(WorkerMessage::Packet(client_addr, data));
+        self.workers[worker].queue()
+    }
+    pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Bytes) {
+        if !self.clients.have_client(client_addr) {
+            let queue = self.next_worker();
+            self.clients.create(&queue, &self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, self.use_heartbeats);
+        }
+
+        self.clients.push(client_addr, WorkerMessage::Packet(client_addr, data));
     }
     pub fn stop(self) {
-        for _ in 0..self.workers.len() {
-            self.queue.push(WorkerMessage::Shutdown);
+        for _ in 0..self.dispatch_workers.len() {
+            self.dispatch_queue.push(DispatchMessage::Shutdown);
         }
-        for worker in self.workers {
+        for worker in self.dispatch_workers {
             worker.join();
+        }
+
+        for worker in self.workers {
+            worker.stop();
         }
 
         self.clients.destroy_each::<_, ()>(|mut client| {

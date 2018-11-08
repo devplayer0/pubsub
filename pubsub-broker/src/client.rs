@@ -306,13 +306,15 @@ impl Subscriptions {
 
 struct ClientWrapper {
     addr: SocketAddr,
-    inner: Arc<Mutex<Client>>,
+    client: Arc<Mutex<Client>>,
+    queue: Arc<MsQueue<WorkerMessage>>,
 }
-impl From<Client> for ClientWrapper {
-    fn from(client: Client) -> Self {
+impl ClientWrapper {
+    pub fn new(client: Client, queue: &Arc<MsQueue<WorkerMessage>>) -> ClientWrapper {
         ClientWrapper {
             addr: client.addr(),
-            inner: Arc::new(Mutex::new(client)),
+            client: Arc::new(Mutex::new(client)),
+            queue: Arc::clone(queue),
         }
     }
 }
@@ -322,26 +324,21 @@ impl PartialEq for ClientWrapper {
     }
 }
 impl Eq for ClientWrapper {}
-impl Deref for ClientWrapper {
-    type Target = Arc<Mutex<Client>>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
 impl evmap::ShallowCopy for ClientWrapper {
     unsafe fn shallow_copy(&mut self) -> Self {
         ClientWrapper {
             addr: self.addr,
-            inner: self.inner.shallow_copy(),
+            client: self.client.shallow_copy(),
+            queue: self.queue.shallow_copy(),
         }
     }
 }
 
 #[derive(DebugStub)]
 pub(crate) struct Clients {
-    #[debug_stub = "evmap::ReadHandle<SocketAddr, Arc<Mutex<Client>>"]
+    #[debug_stub = "evmap::ReadHandle<SocketAddr, (Arc<Mutex<Client>>, Arc<MsQueue<WorkerMessage>>)"]
     read: evmap::ReadHandle<SocketAddr, ClientWrapper, (), hash_map::RandomState>,
-    #[debug_stub = "evmap::WriteHandle<SocketAddr, Arc<Mutex<Client>>"]
+    #[debug_stub = "evmap::WriteHandle<SocketAddr, (Arc<Mutex<Client>>, Arc<MsQueue<WorkerMessage>>)"]
     write: Arc<Mutex<evmap::WriteHandle<SocketAddr, ClientWrapper, (), hash_map::RandomState>>>,
 
     subscriptions: Subscriptions,
@@ -377,9 +374,9 @@ impl Clients {
     pub fn have_client(&self, addr: SocketAddr) -> bool {
         self.read.contains_key(&addr)
     }
-    pub fn create(&self, timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_queue: &Arc<MsQueue<WorkerMessage>>, keepalive: bool) {
+    pub fn create(&self, queue: &Arc<MsQueue<WorkerMessage>>, timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, keepalive: bool) {
         let mut write = self.write.lock().unwrap();
-        write.update(addr, Client::new(timers, addr, socket, buf_source, timeout_queue, keepalive, &self.next_message_id).into());
+        write.update(addr, ClientWrapper::new(Client::new(timers, addr, socket, buf_source, queue, keepalive, &self.next_message_id), queue));
         write.refresh();
     }
     pub fn remove(&self, addr: SocketAddr) {
@@ -390,11 +387,14 @@ impl Clients {
         write.refresh();
     }
     pub fn with<F: FnOnce(MutexGuard<Client>) -> T, T>(&self, addr: SocketAddr, fun: F) -> Option<T> {
-        self.read.get_and(&addr, |list| fun(list[0].lock().unwrap()))
+        self.read.get_and(&addr, |c| fun(c[0].client.lock().unwrap()))
+    }
+    pub fn push(&self, addr: SocketAddr, message: WorkerMessage) -> bool {
+        self.read.get_and(&addr, |c| c[0].queue.push(message)).is_some()
     }
 
     pub fn destroy_each<F: FnMut(MutexGuard<Client>) -> Result<(), E>, E>(self, mut fun: F) -> Result<(), E> {
-        for client in self.read.map_into::<_, Vec<_>, _>(|_, c| Arc::clone(&c[0])) {
+        for client in self.read.map_into::<_, Vec<_>, _>(|_, c| Arc::clone(&c[0].client)) {
             let result = fun(client.lock().unwrap());
             if result.is_err() {
                 return result;

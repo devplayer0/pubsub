@@ -13,8 +13,6 @@ use client::{Action, Clients};
 pub enum WorkerMessage {
     Packet(SocketAddr, Bytes),
     Timeout(protocol::Timeout),
-    DispatchStart(SocketAddr, MessageStart),
-    DispatchSegment(SocketAddr, MessageSegment),
 
     Shutdown,
 }
@@ -26,13 +24,16 @@ impl From<protocol::Timeout> for WorkerMessage {
 
 #[derive(Debug)]
 pub(crate) struct Worker {
+    queue: Arc<MsQueue<WorkerMessage>>,
     thread: JoinHandle<()>,
 }
 impl Worker {
-    pub fn new(clients: &Clients, queue: &Arc<MsQueue<WorkerMessage>>) -> Worker {
+    pub fn new(clients: &Clients, dispatch_queue: &Arc<MsQueue<DispatchMessage>>) -> Worker {
+        let queue = Arc::new(MsQueue::new());
         let thread = {
             let clients = clients.clone();
-            let queue = Arc::clone(queue);
+            let queue = Arc::clone(&queue);
+            let dispatch_queue = Arc::clone(dispatch_queue);
 
             thread::spawn(move || {
                 let mut running = true;
@@ -63,11 +64,11 @@ impl Worker {
                                     },
                                     Action::DispatchStart(start) => {
                                         info!("starting publish message for topic {}", start.topic());
-                                        queue.push(WorkerMessage::DispatchStart(src, start));
+                                        dispatch_queue.push(DispatchMessage::Start(src, start));
                                         Ok(())
                                     },
                                     Action::DispatchSegment(segment) => {
-                                        queue.push(WorkerMessage::DispatchSegment(src, segment));
+                                        dispatch_queue.push(DispatchMessage::Segment(src, segment));
                                         Ok(())
                                     },
                                 } {
@@ -96,7 +97,7 @@ impl Worker {
                                     warn!("error while sending disconnect packet to {}: {}", src, e);
                                 }
                             }) {
-                                debug!("packet from removed client");
+                                debug!("keepalive timeout from removed client");
                             }
 
                             clients.remove(src);
@@ -108,15 +109,57 @@ impl Worker {
                                     error!("error re-sending packets in window to {}: {}", src, e);
                                 }
                             }) {
-                                debug!("packet from removed client");
+                                debug!("ack timeout from removed client");
                             }
 
                             clients.remove(src);
                         },
-                        m@WorkerMessage::DispatchStart(_, _) | m@WorkerMessage::DispatchSegment(_, _) => {
+                        WorkerMessage::Shutdown => running = false,
+                    }
+                }
+            })
+        };
+
+        Worker {
+            queue,
+            thread,
+        }
+    }
+
+    pub fn queue(&self) -> Arc<MsQueue<WorkerMessage>> {
+        Arc::clone(&self.queue)
+    }
+    pub fn stop(self) {
+        self.queue.push(WorkerMessage::Shutdown);
+        self.thread.join().unwrap();
+    }
+}
+
+#[derive(Debug)]
+pub enum DispatchMessage {
+    Start(SocketAddr, MessageStart),
+    Segment(SocketAddr, MessageSegment),
+
+    Shutdown,
+}
+#[derive(Debug)]
+pub(crate) struct DispatchWorker {
+    thread: JoinHandle<()>,
+}
+impl DispatchWorker {
+    pub fn new(clients: &Clients, queue: &Arc<MsQueue<DispatchMessage>>) -> DispatchWorker {
+        let thread = {
+            let clients = clients.clone();
+            let queue = Arc::clone(&queue);
+
+            thread::spawn(move || {
+                let mut running = true;
+                while running {
+                    match queue.pop() {
+                        m@DispatchMessage::Start(_, _) | m@DispatchMessage::Segment(_, _) => {
                             let (src, topic) = match m {
-                                WorkerMessage::DispatchStart(src, ref start) => (src, start.topic()),
-                                WorkerMessage::DispatchSegment(src, ref segment) => (src, segment.topic().unwrap()),
+                                DispatchMessage::Start(src, ref start) => (src, start.topic()),
+                                DispatchMessage::Segment(src, ref segment) => (src, segment.topic().unwrap()),
                                 _ => panic!("impossible"),
                             };
 
@@ -127,11 +170,11 @@ impl Worker {
 
                                 clients.with(dst, |mut client| {
                                     if let Err(e) = match m {
-                                        WorkerMessage::DispatchStart(_, ref start) => {
+                                        DispatchMessage::Start(_, ref start) => {
                                             debug!("starting publish for topic {} to {}", start.topic(), dst);
                                             client.send_msg_start(&start)
                                         },
-                                        WorkerMessage::DispatchSegment(_, ref segment) => {
+                                        DispatchMessage::Segment(_, ref segment) => {
                                             client.send_msg_segment(&segment)
                                         }
                                         _ => panic!("impossible"),
@@ -141,26 +184,27 @@ impl Worker {
                                     Ok(())
                                 }).expect("subscription for disconnected client!")
                             }) {
-                                error!("error while dispatching message start to {}: {}", dst, e);
+                                error!("error while dispatching message packet to {}: {}", dst, e);
                                 clients.with(dst, |mut client| {
                                     if let Err(e) = client.send_disconnect() {
                                         warn!("error while sending disconnect packet to {}: {}", src, e);
                                     }
-                                }).unwrap();
+                                });
 
                                 clients.remove(dst);
                             }
                         },
-                        WorkerMessage::Shutdown => running = false,
+                        DispatchMessage::Shutdown => running = false,
                     }
                 }
             })
         };
 
-        Worker {
+        DispatchWorker {
             thread,
         }
     }
+
     pub fn join(self) {
         self.thread.join().unwrap();
     }
