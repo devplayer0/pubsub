@@ -28,7 +28,8 @@ use bytes::{BufMut, Bytes};
 use crossbeam::queue::MsQueue;
 
 use common::constants;
-use common::util::{self, BufferProvider};
+use common::util::BufferProvider;
+pub use common::util::default_packet_size;
 use common::timer::TimerManager;
 use common::packet::PacketType;
 use common::protocol::Timeout;
@@ -39,7 +40,7 @@ mod worker;
 use client::Clients;
 use worker::{Worker, WorkerMessage};
 
-const BUFFER_PREALLOC_SIZE: usize = 16384 * constants::IPV6_MAX_PACKET_SIZE;
+const BUFFER_PREALLOC_COUNT: usize = 16384;
 
 quick_error! {
     #[derive(Debug)]
@@ -103,13 +104,15 @@ struct WorkerManager {
     sockets: HashMap<SocketAddr, UdpSocket>,
 
     use_heartbeats: bool,
+    ipv4_size: u16,
+    ipv6_size: u16,
     workers: Vec<Worker>,
     next_worker: usize,
 
     clients: Clients,
 }
 impl WorkerManager {
-    pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool) -> WorkerManager {
+    pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool, ipv4_size: u16, ipv6_size: u16) -> WorkerManager {
         let threads = cmp::max(num_cpus::get() - 1, 1);
         let worker_count = cmp::max(threads / 2, 1);
         info!("creating {} workers...", worker_count);
@@ -128,6 +131,8 @@ impl WorkerManager {
             sockets: sockets.into_iter().map(|s| (s.local_addr().unwrap(), s)).collect(),
 
             use_heartbeats,
+            ipv4_size,
+            ipv6_size,
             workers,
             next_worker: 0,
 
@@ -147,7 +152,10 @@ impl WorkerManager {
     pub fn dispatch(&mut self, local_addr: SocketAddr, client_addr: SocketAddr, data: Bytes) {
         if !self.clients.have_client(client_addr) {
             let queue = self.next_worker();
-            self.clients.create(&queue, &self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, self.use_heartbeats);
+            self.clients.create(&queue, &self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, self.use_heartbeats, match local_addr {
+                SocketAddr::V4(_) => self.ipv4_size,
+                SocketAddr::V6(_) => self.ipv6_size,
+            });
         }
 
         self.clients.dispatch(client_addr, WorkerMessage::Packet(client_addr, data));
@@ -176,10 +184,25 @@ pub struct Broker {
     io_threads: Vec<thread::JoinHandle<()>>,
 }
 impl Broker {
-    pub fn bind<'a, I>(addrs: I, use_heartbeats: bool) -> Result<Broker, Error>
+    #[inline]
+    pub fn bind_default<'a, I>(addrs: I) -> Result<Broker, Error>
     where I: IntoIterator<Item = &'a SocketAddr>
     {
-        let buf_source = BufferProvider::new(BUFFER_PREALLOC_SIZE, constants::IPV6_MAX_PACKET_SIZE);
+        Broker::bind(addrs, true, 0, 0)
+    }
+    pub fn bind<'a, I>(addrs: I, use_heartbeats: bool, mut ipv4_size: u16, mut ipv6_size: u16) -> Result<Broker, Error>
+    where I: IntoIterator<Item = &'a SocketAddr>
+    {
+        if ipv4_size == 0 {
+            ipv4_size = constants::IPV4_DEFAULT_PACKET_SIZE;
+        }
+        if ipv6_size == 0 {
+            ipv6_size = constants::IPV6_DEFAULT_PACKET_SIZE;
+        }
+        let buf_source = {
+            let biggest = cmp::max(ipv4_size, ipv6_size) as usize;
+            BufferProvider::new(biggest * BUFFER_PREALLOC_COUNT, biggest)
+        };
 
         let mut sockets = Vec::new();
         for addr in addrs {
@@ -193,18 +216,23 @@ impl Broker {
         let clients = Arc::new(Mutex::new(WorkerManager::new(
                     sockets.iter().map(|s| s.try_clone().unwrap()).collect(),
                     &buf_source,
-                    use_heartbeats)));
+                    use_heartbeats,
+                    ipv4_size, ipv6_size)));
         let running = Arc::new(AtomicBool::new(true));
         let mut io_threads = Vec::new();
         for socket in sockets {
             let addr = socket.local_addr().unwrap();
+            let max_packet_size = match addr {
+                SocketAddr::V4(_) => ipv4_size,
+                SocketAddr::V6(_) => ipv6_size,
+            };
 
             let running = Arc::clone(&running);
             let mut buf_source = buf_source.clone();
             let clients = Arc::clone(&clients);
             io_threads.push(thread::spawn(move || {
                 while running.load(Ordering::SeqCst) {
-                    let mut packet_buffer = buf_source.allocate(util::max_packet_size(addr));
+                    let mut packet_buffer = buf_source.allocate(max_packet_size as usize);
 
                     let (size, src) = unsafe {
                         let (size, src) = match socket.recv_from(packet_buffer.bytes_mut()) {

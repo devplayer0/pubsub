@@ -122,6 +122,7 @@ pub struct Client {
     protocol: Jqtt,
     buf_source: BufferProvider,
 
+    max_packet_size: u16,
     connected: bool,
     keepalive: Option<KeepaliveManager>,
     msg_mapping: MessageMapping,
@@ -149,7 +150,7 @@ impl DerefMut for Client {
     }
 }
 impl Client {
-    pub fn new(timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_queue: &Arc<MsQueue<WorkerMessage>>, keepalive: bool, next_message_id: &Arc<AtomicU32>) -> Client {
+    pub fn new(timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, timeout_queue: &Arc<MsQueue<WorkerMessage>>, keepalive: bool, max_packet_size: u16, next_message_id: &Arc<AtomicU32>) -> Client {
         let keepalive = match keepalive {
             true => {
                 let queue = Arc::clone(timeout_queue);
@@ -165,6 +166,7 @@ impl Client {
             protocol: Jqtt::new(timers, buf_source, addr, socket, timeout_callback),
             buf_source: buf_source.clone(),
 
+            max_packet_size,
             connected: false,
             keepalive,
             msg_mapping: MessageMapping::new(addr, next_message_id),
@@ -184,13 +186,13 @@ impl Client {
             Ok(ref p) if !self.connected => match p {
                 Connect => {
                     self.connected = true;
-                    self.send_connack(self.keepalive.is_some())?
+                    self.send_connack(self.keepalive.is_some(), self.max_packet_size)?
                 },
                 _ => return Err(Error::NotConnected),
             },
             Ok(p) => match p {
                 Connect => return Err(Error::AlreadyConnected),
-                ConnAck(_) => return Err(Error::ServerOnly(PacketType::ConnAck)),
+                ConnAck(_, _) => return Err(Error::ServerOnly(PacketType::ConnAck)),
                 Heartbeat => match self.keepalive {
                     Some(ref mut manager) => {
                         manager.heartbeat();
@@ -389,9 +391,9 @@ impl Clients {
     pub fn have_client(&self, addr: SocketAddr) -> bool {
         self.read.contains_key(&addr)
     }
-    pub fn create(&self, queue: &Arc<MsQueue<WorkerMessage>>, timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, keepalive: bool) {
+    pub fn create(&self, queue: &Arc<MsQueue<WorkerMessage>>, timers: &TimerManager<Timeout>, addr: SocketAddr, socket: UdpSocket, buf_source: &BufferProvider, keepalive: bool, max_packet_size: u16) {
         let mut write = self.write.lock().unwrap();
-        write.update(addr, ClientWrapper::new(Client::new(timers, addr, socket, buf_source, queue, keepalive, &self.next_message_id), queue));
+        write.update(addr, ClientWrapper::new(Client::new(timers, addr, socket, buf_source, queue, keepalive, max_packet_size, &self.next_message_id), queue));
         write.refresh();
     }
     pub fn remove(&self, addr: SocketAddr) {

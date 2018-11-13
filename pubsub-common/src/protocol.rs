@@ -268,9 +268,6 @@ impl Jqtt {
         }
     }
 
-    pub fn max_packet_size(&self) -> usize {
-        util::max_packet_size(self.addr)
-    }
     pub fn send_seq(&self) -> u8 {
         self.send_seq
     }
@@ -333,7 +330,6 @@ impl Jqtt {
         self.send_buffer.len() == SEND_BUFFER_SIZE
     }
     pub fn gbn_send(&mut self, data: Bytes) -> Result<usize, Error> {
-        assert!(data.len() <= self.max_packet_size());
         if self.window_full() && self.send_buffer_full() {
             return Err(Error::SendBufferFull);
         }
@@ -393,11 +389,11 @@ impl Jqtt {
                 _ => Err(Malformed(Connect)),
             },
             ConnAck => match data.remaining() {
-                0 if seq & 0b110 == 0 => Ok(Packet::ConnAck(match seq {
+                2 if seq & 0b110 == 0 => Ok(Packet::ConnAck(match seq {
                     0 => false,
                     1 => true,
                     _ => panic!("impossible"),
-                })),
+                }, data.get_u16_be())),
                 _ => Err(Malformed(ConnAck)),
             },
             Heartbeat => match data.remaining() {
@@ -453,12 +449,16 @@ impl Jqtt {
         self.socket.send_to(&data, self.addr)?;
         Ok(())
     }
-    pub fn send_connack(&self, keepalive: bool) -> Result<(), Error> {
+    pub fn send_connack(&self, keepalive: bool, max_packet_size: u16) -> Result<(), Error> {
+        let mut bytes = BytesMut::with_capacity(3);
         let header = Packet::encode_header(PacketType::ConnAck, match keepalive {
             false => 0,
             true => 1,
         });
-        self.socket.send_to(&[header], self.addr)?;
+        bytes.put(header);
+        bytes.put_u16_be(max_packet_size);
+
+        self.socket.send_to(&bytes, self.addr)?;
         Ok(())
     }
     pub fn send_heartbeat(&self) -> Result<(), Error> {
@@ -474,18 +474,18 @@ impl Jqtt {
         self.gbn_send(bytes.freeze())?;
         Ok(())
     }
-    pub fn send_subscribe(&mut self, topic: &str) -> Result<usize, Error> {
+    pub fn send_subscribe(&mut self, topic: &str, max_packet_size: u16) -> Result<usize, Error> {
         let topic = topic.as_bytes();
-        assert!(topic.len() <= MAX_TOPIC_LENGTH);
+        assert!(topic.len() <= util::max_topic_len(max_packet_size) as usize);
 
         let mut data = self.buf_source.allocate(1 + topic.len());
         data.put_u8(Packet::encode_header(PacketType::Subscribe, self.send_seq));
         data.put(topic);
         self.gbn_send(data.freeze())
     }
-    pub fn send_unsubscribe(&mut self, topic: &str) -> Result<usize, Error> {
+    pub fn send_unsubscribe(&mut self, topic: &str, max_packet_size: u16) -> Result<usize, Error> {
         let topic = topic.as_bytes();
-        assert!(topic.len() <= MAX_TOPIC_LENGTH);
+        assert!(topic.len() <= util::max_topic_len(max_packet_size) as usize);
 
         let mut data = self.buf_source.allocate(1 + topic.len());
         data.put_u8(Packet::encode_header(PacketType::Unsubscribe, self.send_seq));

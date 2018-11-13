@@ -41,7 +41,7 @@ impl Display for PacketType {
 #[derive(Debug)]
 pub enum Packet<'a> {
     Connect,
-    ConnAck(bool),
+    ConnAck(bool, u16),
     Heartbeat,
     Ack(u8),
     Disconnect,

@@ -17,11 +17,11 @@ extern crate crossbeam;
 
 extern crate pubsub_common as common;
 
-use bytes::{BufMut, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam::queue::MsQueue;
 
 use common::constants;
-use common::util::{self, BufferProvider};
+use common::util::BufferProvider;
 pub use common::timer::TimerManager;
 use common::packet::{PacketType, Packet};
 use common::protocol::{self, KeepaliveManager, Jqtt};
@@ -30,7 +30,7 @@ pub mod messaging;
 pub use messaging::{Message, MessageListener, MessageCollector, CompleteMessageListener};
 use messaging::OutgoingMessage;
 
-const BUFFER_PREALLOC_SIZE: usize = 1024 * constants::IPV6_MAX_PACKET_SIZE;
+const BUFFER_PREALLOC_COUNT: usize = 4;
 
 macro_rules! await_sendbuf_space {
     ($condvar:expr, $running:expr, $space:expr) => {{
@@ -154,7 +154,7 @@ impl<M: MessageListener + Send> ClientInner<M> {
             Err(e) => return Err(e.into()),
             Ok(p) => match p {
                 Connect => return Err(Error::ClientOnly(PacketType::Connect)),
-                ConnAck(_) => {},
+                ConnAck(_, _) => {},
                 Heartbeat => match self.keepalive {
                     Some(ref mut manager) => manager.heartbeat(),
                     None => warn!("received heartbeat from {}, but keepalive is disabled", self.remote),
@@ -177,6 +177,7 @@ impl<M: MessageListener + Send> ClientInner<M> {
 pub struct Client<'a> {
     buf_source: BufferProvider,
     protocol: Arc<Mutex<Jqtt>>,
+    max_packet_size: u16,
 
     running: Arc<AtomicBool>,
     io_thread: JoinHandle<()>,
@@ -217,7 +218,7 @@ impl<'a> Client<'a> {
         let (remote, socket) = Client::udp_connect(server)?;
         socket.set_read_timeout(Some(Duration::from_millis(250)))?;
 
-        let buf_source = BufferProvider::new(BUFFER_PREALLOC_SIZE, util::max_packet_size(remote));
+        let buf_source = BufferProvider::new(std::u16::MAX as usize * BUFFER_PREALLOC_COUNT, std::u16::MAX as usize);
 
         let queue = Arc::new(MsQueue::new());
         let protocol = {
@@ -226,19 +227,21 @@ impl<'a> Client<'a> {
             Arc::new(Mutex::new(Jqtt::new(timers, &buf_source, remote, socket.try_clone().unwrap(), callback)))
         };
         let mut keepalive = None;
+        let mut max_packet_size = 0;
         for _ in 0..constants::CONNECT_RETRIES {
             let mut protocol = protocol.lock().unwrap();
             protocol.send_connect()?;
 
-            let mut response = buf_source.allocate(util::max_packet_size(remote));
+            let mut response = BytesMut::with_capacity(std::u16::MAX as usize);
             unsafe {
                 let received = socket.recv(response.bytes_mut())?;
                 response.advance_mut(received);
                 response.truncate(received);
             }
             match protocol.decode(&response.freeze()) {
-                Ok(Packet::ConnAck(ka)) => {
+                Ok(Packet::ConnAck(ka, mps)) => {
                     keepalive = Some(ka);
+                    max_packet_size = mps;
                     break;
                 },
                 Ok(p) => warn!("received unexpected packet from server while trying to connect: {:?}", p),
@@ -263,7 +266,7 @@ impl<'a> Client<'a> {
             };
             thread::spawn(move || {
                 while running.load(Ordering::SeqCst) {
-                    let mut packet_buffer = buf_source.allocate(util::max_packet_size(remote));
+                    let mut packet_buffer = buf_source.allocate(max_packet_size as usize);
 
                     let size = unsafe {
                         let size = match socket.recv(packet_buffer.bytes_mut()) {
@@ -273,7 +276,7 @@ impl<'a> Client<'a> {
                                 queue.push(InternalMessage::IoError(e));
                                 running.store(false, Ordering::SeqCst);
                                 break;
-                            }
+                            },
                         };
                         packet_buffer.advance_mut(size);
                         size
@@ -370,6 +373,7 @@ impl<'a> Client<'a> {
         Ok(Client {
             buf_source: buf_source.clone(),
             protocol,
+            max_packet_size,
 
             running,
             io_thread,
@@ -396,7 +400,7 @@ impl<'a> Client<'a> {
         }
         await_sendbuf_space!(self.send_space, self.running);
 
-        let pid = self.protocol.lock().unwrap().send_subscribe(topic)?;
+        let pid = self.protocol.lock().unwrap().send_subscribe(topic, self.max_packet_size)?;
         await_packet_ack!(self.acked_pid, self.running, pid);
 
         Ok(())
@@ -407,7 +411,7 @@ impl<'a> Client<'a> {
         }
         await_sendbuf_space!(self.send_space, self.running);
 
-        let pid = self.protocol.lock().unwrap().send_unsubscribe(topic)?;
+        let pid = self.protocol.lock().unwrap().send_unsubscribe(topic, self.max_packet_size)?;
         await_packet_ack!(self.acked_pid, self.running, pid);
 
         Ok(())
@@ -418,7 +422,7 @@ impl<'a> Client<'a> {
             return Err(Error::Shutdown);
         }
 
-        self.messages.push(OutgoingMessage::new(&self.buf_source, message, self.next_msg_id));
+        self.messages.push(OutgoingMessage::new(&self.buf_source, self.max_packet_size, message, self.next_msg_id));
         self.next_msg_id = self.next_msg_id.wrapping_add(1);
         Ok(())
     }
@@ -441,7 +445,7 @@ impl<'a> Client<'a> {
                         let data = msg.first_packet(protocol.send_seq());
                         pid = protocol.gbn_send(data)?;
                     } else {
-                        let (fin, data) = msg.next_packet(protocol.max_packet_size(), protocol.send_seq())?;
+                        let (fin, data) = msg.next_packet(self.max_packet_size, protocol.send_seq())?;
                         pid = protocol.gbn_send(data.unwrap())?;
                         if fin {
                             finished = true;

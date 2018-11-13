@@ -8,8 +8,7 @@ use std::io::{self, Read};
 use bytes::{IntoBuf, Buf, BufMut, Bytes, BytesMut, Reader};
 
 use ::Error;
-use common::constants::*;
-use common::util::BufferProvider;
+use common::util::{self, BufferProvider};
 use common::packet::{PacketType, Packet};
 pub use common::protocol::{MessageStart, MessageSegment};
 
@@ -71,9 +70,9 @@ pub(crate) struct OutgoingMessage<'a> {
     read: u32,
 }
 impl<'a> OutgoingMessage<'a> {
-    pub(crate) fn new<R: Read + Send + 'a>(buf_source: &BufferProvider, message: Message<R>, id: u32) -> OutgoingMessage<'a> {
+    pub(crate) fn new<R: Read + Send + 'a>(buf_source: &BufferProvider, max_packet_size: u16, message: Message<R>, id: u32) -> OutgoingMessage<'a> {
         let topic_len = message.topic().as_bytes().len();
-        assert!(topic_len <= MAX_TOPIC_LENGTH);
+        assert!(topic_len <= util::max_topic_len(max_packet_size) as usize);
 
         let mut first_buffer = buf_source.allocate(1 + size_of::<u32>() + size_of::<u32>() + topic_len);
         first_buffer.put_u8(0);
@@ -98,13 +97,13 @@ impl<'a> OutgoingMessage<'a> {
         data[0] = Packet::encode_header(PacketType::PublishStart, seq);
         data.freeze()
     }
-    pub(crate) fn next_packet(&mut self, max_packet_size: usize, seq: u8) -> Result<(bool, Option<Bytes>), io::Error> {
+    pub(crate) fn next_packet(&mut self, max_packet_size: u16, seq: u8) -> Result<(bool, Option<Bytes>), io::Error> {
         if self.read == self.message.size {
             return Ok((true, None));
         }
 
         let header_size = 1 + size_of::<u32>();
-        let data_size = max_packet_size - header_size;
+        let data_size = max_packet_size as usize - header_size;
         let to_read = cmp::min((self.message.size - self.read) as usize, data_size);
         let mut data = self.buf_source.allocate(header_size + to_read);
         data.put_u8(Packet::encode_header(PacketType::PublishData, seq));

@@ -1,4 +1,5 @@
 use std::cmp;
+use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::net::SocketAddr;
 
@@ -7,11 +8,15 @@ use bytes::BytesMut;
 use constants;
 
 #[inline]
-pub fn max_packet_size(addr: SocketAddr) -> usize {
+pub fn default_packet_size(addr: SocketAddr) -> u16 {
     match addr {
-        SocketAddr::V4(_) => constants::IPV4_MAX_PACKET_SIZE,
-        SocketAddr::V6(_) => constants::IPV6_MAX_PACKET_SIZE,
+        SocketAddr::V4(_) => constants::IPV4_DEFAULT_PACKET_SIZE,
+        SocketAddr::V6(_) => constants::IPV6_DEFAULT_PACKET_SIZE,
     }
+}
+#[inline]
+pub fn max_topic_len(max_packet_size: u16) -> u16 {
+    max_packet_size - 1 - size_of::<u32>() as u16 - size_of::<u32>() as u16
 }
 
 #[derive(Debug)]
