@@ -197,7 +197,7 @@ impl<'a> Client<'a> {
         let mut final_socket = None;
         for addr in addr.to_socket_addrs()? {
             let socket = UdpSocket::bind(match addr {
-                SocketAddr::V4(_) => "127.0.0.0:0",
+                SocketAddr::V4(_) => "0.0.0.0:0",
                 SocketAddr::V6(_) => ":::0",
             })?;
             socket.connect(addr)?;
