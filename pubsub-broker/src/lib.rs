@@ -112,9 +112,11 @@ struct WorkerManager {
     clients: Clients,
 }
 impl WorkerManager {
-    pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, use_heartbeats: bool, ipv4_size: u16, ipv6_size: u16) -> WorkerManager {
-        let threads = cmp::max(num_cpus::get() - 1, 1);
-        let worker_count = cmp::max(threads / 2, 1);
+    pub fn new(sockets: Vec<UdpSocket>, buf_source: &BufferProvider, threads: usize, use_heartbeats: bool, ipv4_size: u16, ipv6_size: u16) -> WorkerManager {
+        let worker_count = match threads {
+            0 => cmp::max(num_cpus::get() - 1, 1),
+            t => t,
+        };
         info!("creating {} workers...", worker_count);
 
         let mut workers = Vec::with_capacity(worker_count);
@@ -188,9 +190,9 @@ impl Broker {
     pub fn bind_default<'a, I>(addrs: I) -> Result<Broker, Error>
     where I: IntoIterator<Item = &'a SocketAddr>
     {
-        Broker::bind(addrs, true, 0, 0)
+        Broker::bind(addrs, 0, true, 0, 0)
     }
-    pub fn bind<'a, I>(addrs: I, use_heartbeats: bool, mut ipv4_size: u16, mut ipv6_size: u16) -> Result<Broker, Error>
+    pub fn bind<'a, I>(addrs: I, threads: usize, keepalive: bool, mut ipv4_size: u16, mut ipv6_size: u16) -> Result<Broker, Error>
     where I: IntoIterator<Item = &'a SocketAddr>
     {
         if ipv4_size == 0 {
@@ -216,7 +218,8 @@ impl Broker {
         let clients = Arc::new(Mutex::new(WorkerManager::new(
                     sockets.iter().map(|s| s.try_clone().unwrap()).collect(),
                     &buf_source,
-                    use_heartbeats,
+                    threads,
+                    keepalive,
                     ipv4_size, ipv6_size)));
         let running = Arc::new(AtomicBool::new(true));
         let mut io_threads = Vec::new();

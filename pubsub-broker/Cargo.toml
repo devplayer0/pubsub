@@ -7,10 +7,8 @@ authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
 debug_stub_derive = "~0.3"
 quick-error = "~1.2"
 log = "~0.4"
-simplelog = "~0.5"
 evmap = "~4.0"
-crossbeam = "~0.4"
+crossbeam = "~0.5"
 bytes = "~0.4"
 num_cpus = "~1.8"
-ctrlc = { version = "~3.0", features = [ "termination" ] }
 pubsub-common = { path = "../pubsub-common" }

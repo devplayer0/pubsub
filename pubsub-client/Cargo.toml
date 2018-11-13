@@ -9,5 +9,5 @@ debug_stub_derive = "~0.3"
 log = "~0.4"
 simplelog = "~0.5"
 bytes = "~0.4"
-crossbeam = "~0.4"
+crossbeam = "~0.5"
 pubsub-common = { path = "../pubsub-common" }

@@ -1,0 +1,11 @@
+[package]
+name = "pubsub-broker-server"
+version = "0.1.0"
+authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
+
+[dependencies]
+log = "~0.4"
+simplelog = "~0.5"
+clap = "~2.32"
+ctrlc = { version = "~3.0", features = [ "termination" ] }
+pubsub-broker = { path = "../pubsub-broker" }

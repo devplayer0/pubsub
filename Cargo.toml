@@ -3,4 +3,5 @@ members = [
 	"pubsub-common",
 	"pubsub-broker",
 	"pubsub-client",
+	"pubsub-broker-server",
 ]
