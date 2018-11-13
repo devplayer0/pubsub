@@ -1,4 +1,3 @@
-use std::ops::{Deref, DerefMut};
 use std::cmp;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
@@ -122,17 +121,6 @@ impl PartialEq for MessageSegment {
     }
 }
 impl Eq for MessageSegment {}
-impl Deref for MessageSegment {
-    type Target = Bytes;
-    fn deref(&self) -> &Self::Target {
-        &self.headerless
-    }
-}
-impl DerefMut for MessageSegment {
-    fn deref_mut(&mut self) -> &mut Bytes {
-        &mut self.headerless
-    }
-}
 impl Clone for MessageSegment {
     fn clone(&self) -> MessageSegment {
         let start = match self.start {
@@ -167,6 +155,9 @@ impl MessageSegment {
     pub fn link_start(&mut self, start: &MessageStart) {
         self.start = Some(start.clone());
     }
+    pub fn size(&self) -> u32 {
+        self.headerless.len() as u32
+    }
     pub fn topic(&self) -> Option<&str> {
         match self.start {
             Some(ref s) => Some(s.topic()),
@@ -184,10 +175,10 @@ impl MessageSegment {
         self.headerless
     }
     pub fn with_seq(&self, buf_source: &BufferProvider, seq: u8) -> Bytes {
-        let mut data = buf_source.allocate(1 + size_of::<u32>() + self.len());
+        let mut data = buf_source.allocate(1 + size_of::<u32>() + self.headerless.len());
         data.put_u8(Packet::encode_header(PacketType::PublishData, seq));
         data.put_u32_be(self.id);
-        data.put(&**self);
+        data.put(&self.headerless);
         data.freeze()
     }
 }

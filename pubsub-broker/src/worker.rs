@@ -42,56 +42,54 @@ impl Worker {
                 let mut running = true;
                 while running {
                     match queue.pop() {
-                        WorkerMessage::Packet(src, data) => {
-                            match clients.with(src, |mut client| {
-                                trace!("worker from thread {:?} got a packet of {} bytes from {}!", thread::current().id(), data.len(), src);
-                                let action = {
-                                    match client.handle(&data) {
-                                        Ok(Some(a)) => a,
-                                        Ok(None) => return false,
-                                        Err(e) => {
-                                            error!("error while processing packet from {}: {}", src, e);
-                                            Action::Disconnect
-                                        },
-                                    }
-                                };
-                                if let Err(e) = match action {
-                                    Action::Disconnect => Err(Error::DisconnectAction),
-                                    Action::Subscribe(topic) => {
-                                        debug!("subscribing {} to {}", src, topic);
-                                        clients.subscriptions().subscribe(topic, src)
+                        WorkerMessage::Packet(src, data) => match clients.with(src, |mut client| {
+                            trace!("worker from thread {:?} got a packet of {} bytes from {}!", thread::current().id(), data.len(), src);
+                            let action = {
+                                match client.handle(&data) {
+                                    Ok(Some(a)) => a,
+                                    Ok(None) => return false,
+                                    Err(e) => {
+                                        error!("error while processing packet from {}: {}", src, e);
+                                        Action::Disconnect
                                     },
-                                    Action::Unsubscribe(topic) => {
-                                        debug!("unsubscribing {} from {}", src, topic);
-                                        clients.subscriptions().unsubscribe(topic, src)
-                                    },
-                                    Action::DispatchStart(start) => {
-                                        info!("starting publish message for topic {}", start.topic());
-                                        dispatch_queue.push(DispatchMessage::Start(src, start));
-                                        Ok(())
-                                    },
-                                    Action::DispatchSegment(segment) => {
-                                        dispatch_queue.push(DispatchMessage::Segment(src, segment));
-                                        Ok(())
-                                    },
-                                } {
-                                    match e {
-                                        Error::DisconnectAction => info!("disconnecting {}", src),
-                                        _ => info!("error while performing user {} action: {}", src, e),
-                                    }
-                                    if let Err(e) = client.send_disconnect() {
-                                        warn!("error while sending disconnect packet to {}: {}", src, e);
-                                    }
-
-                                    return true;
+                                }
+                            };
+                            if let Err(e) = match action {
+                                Action::Disconnect => Err(Error::DisconnectAction),
+                                Action::Subscribe(topic) => {
+                                    debug!("subscribing {} to {}", src, topic);
+                                    clients.subscriptions().subscribe(topic, src)
+                                },
+                                Action::Unsubscribe(topic) => {
+                                    debug!("unsubscribing {} from {}", src, topic);
+                                    clients.subscriptions().unsubscribe(topic, src)
+                                },
+                                Action::DispatchStart(start) => {
+                                    info!("starting publish message for topic {}", start.topic());
+                                    dispatch_queue.push(DispatchMessage::Start(src, start));
+                                    Ok(())
+                                },
+                                Action::DispatchSegment(segment) => {
+                                    dispatch_queue.push(DispatchMessage::Segment(src, segment));
+                                    Ok(())
+                                },
+                            } {
+                                match e {
+                                    Error::DisconnectAction => info!("disconnecting {}", src),
+                                    _ => info!("error while performing user {} action: {}", src, e),
+                                }
+                                if let Err(e) = client.send_disconnect() {
+                                    warn!("error while sending disconnect packet to {}: {}", src, e);
                                 }
 
-                                false
-                            }) {
-                                Some(false) => {},
-                                Some(true) => clients.remove(src),
-                                None => debug!("packet from removed client"),
+                                return true;
                             }
+
+                            false
+                        }) {
+                            Some(false) => {},
+                            Some(true) => clients.remove(src),
+                            None => debug!("packet from removed client"),
                         },
                         WorkerMessage::Timeout(protocol::Timeout::Keepalive(src)) => {
                             error!("client {} timed out, disconnecting...", src);
@@ -172,36 +170,36 @@ impl DispatchWorker {
                                 _ => panic!("impossible"),
                             };
 
-                            if let Some(Err((dst, e))) = clients.subscriptions().with_topic_each(topic, |dst| {
+                            clients.subscriptions().with_topic_each::<_, ()>(topic, |dst| {
                                 if dst == src {
                                     return Ok(());
                                 }
 
-                                clients.with(dst, |mut client| {
-                                    if let Err(e) = match m {
-                                        DispatchMessage::Start(_, ref start) => {
-                                            debug!("starting publish for topic {} to {}", start.topic(), dst);
-                                            client.send_msg_start(&start)
-                                        },
-                                        DispatchMessage::Segment(_, ref segment) => {
-                                            client.send_msg_segment(&segment)
-                                        }
-                                        _ => panic!("impossible"),
-                                    } {
-                                        return Err((dst, e));
+                                match clients.with(dst, |mut client| match m {
+                                    DispatchMessage::Start(_, ref start) => {
+                                        debug!("starting publish for topic {} to {}", start.topic(), dst);
+                                        client.send_msg_start(start)
+                                    },
+                                    DispatchMessage::Segment(_, ref segment) => {
+                                        client.send_msg_segment(segment)
                                     }
-                                    Ok(())
-                                }).expect("subscription for disconnected client!")
-                            }) {
-                                error!("error while dispatching message packet to {}: {}", dst, e);
-                                clients.with(dst, |mut client| {
-                                    if let Err(e) = client.send_disconnect() {
-                                        warn!("error while sending disconnect packet to {}: {}", src, e);
-                                    }
-                                });
+                                    _ => panic!("impossible"),
+                                }) {
+                                    Some(Ok(_)) => {},
+                                    Some(Err(e)) => {
+                                        error!("error while dispatching message packet to {}: {}", dst, e);
+                                        clients.with(dst, |mut client| {
+                                            if let Err(e) = client.send_disconnect() {
+                                                warn!("error while sending disconnect packet to {}: {}", src, e);
+                                            }
+                                        });
 
-                                clients.remove(dst);
-                            }
+                                        clients.remove(dst);
+                                    },
+                                    None => debug!("subscription for disconnected client!"),
+                                }
+                                Ok(())
+                            });
                         },
                         DispatchMessage::Shutdown => running = false,
                     }

@@ -105,7 +105,7 @@ impl MessageMapping {
 
         if {
             let info = self.inner.get_mut(&segment.id()).unwrap();
-            let finished = info.dispatched(segment.len() as u32)?;
+            let finished = info.dispatched(segment.size())?;
             segment.link_start(&info.start);
             segment.set_id(info.mapped_id());
             finished

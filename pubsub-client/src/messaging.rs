@@ -143,7 +143,7 @@ impl IncomingMessage {
         }
     }
     fn append(&mut self, data: MessageSegment) -> Result<bool, Error> {
-        let new_size = self.size + data.len() as u32;
+        let new_size = self.size + data.size();
         if new_size > self.start.size() {
             return Err(Error::MessageTooBig(self.start.size(), new_size));
         }
