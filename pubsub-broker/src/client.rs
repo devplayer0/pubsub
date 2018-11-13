@@ -394,7 +394,7 @@ impl Clients {
     pub fn with<F: FnOnce(MutexGuard<Client>) -> T, T>(&self, addr: SocketAddr, fun: F) -> Option<T> {
         self.read.get_and(&addr, |c| fun(c[0].client.lock().unwrap()))
     }
-    pub fn push(&self, addr: SocketAddr, message: WorkerMessage) -> bool {
+    pub fn dispatch(&self, addr: SocketAddr, message: WorkerMessage) -> bool {
         self.read.get_and(&addr, |c| c[0].queue.push(message)).is_some()
     }
 

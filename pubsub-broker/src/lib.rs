@@ -144,7 +144,7 @@ impl WorkerManager {
             self.clients.create(&queue, &self.timers, client_addr, self.sockets[&local_addr].try_clone().unwrap(), &self.buf_source, self.use_heartbeats);
         }
 
-        self.clients.push(client_addr, WorkerMessage::Packet(client_addr, data));
+        self.clients.dispatch(client_addr, WorkerMessage::Packet(client_addr, data));
     }
     pub fn stop(self) {
         for worker in self.workers {
