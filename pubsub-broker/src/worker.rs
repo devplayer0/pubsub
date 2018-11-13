@@ -81,7 +81,7 @@ impl Worker {
                                             Action::DispatchSegment(ref segment) => {
                                                 client.send_msg_segment(segment)
                                             }
-                                            _ => panic!("impossible"),
+                                            _ => unreachable!(),
                                         }) {
                                             Some(Ok(_)) => {},
                                             Some(Err(e)) => {

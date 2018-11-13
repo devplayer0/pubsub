@@ -122,6 +122,7 @@ pub struct Client {
     protocol: Jqtt,
     buf_source: BufferProvider,
 
+    connected: bool,
     keepalive: Option<KeepaliveManager>,
     msg_mapping: MessageMapping,
 }
@@ -164,6 +165,7 @@ impl Client {
             protocol: Jqtt::new(timers, buf_source, addr, socket, timeout_callback),
             buf_source: buf_source.clone(),
 
+            connected: false,
             keepalive,
             msg_mapping: MessageMapping::new(addr, next_message_id),
         }
@@ -175,11 +177,19 @@ impl Client {
 
     pub fn handle<'a>(&mut self, data: &'a Bytes) -> Result<Option<Action<'a>>, Error> {
         use self::Packet::*;
+
         match self.protocol.decode(&data) {
             Err(e@common::Error::InvalidAck(_, _, _)) | Err(e@common::Error::OutOfOrder(_, _)) => warn!("client {}: {}", self.addr, e),
             Err(e) => return Err(e.into()),
+            Ok(ref p) if !self.connected => match p {
+                Connect => {
+                    self.connected = true;
+                    self.send_connack(self.keepalive.is_some())?
+                },
+                _ => return Err(Error::NotConnected),
+            },
             Ok(p) => match p {
-                Connect => self.send_connack(self.keepalive.is_some())?,
+                Connect => return Err(Error::AlreadyConnected),
                 ConnAck(_) => return Err(Error::ServerOnly(PacketType::ConnAck)),
                 Heartbeat => match self.keepalive {
                     Some(ref mut manager) => {

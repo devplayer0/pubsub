@@ -470,6 +470,7 @@ impl Jqtt {
         let mut bytes = BytesMut::with_capacity(1);
         bytes.put_u8(Packet::encode_header(PacketType::Disconnect, self.send_seq));
 
+        self.send_buffer.clear();
         self.gbn_send(bytes.freeze())?;
         Ok(())
     }

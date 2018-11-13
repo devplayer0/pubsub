@@ -59,6 +59,12 @@ quick_error! {
             description(err.description())
             cause(err)
         }
+        NotConnected {
+            description("not connected")
+        }
+        AlreadyConnected {
+            description("already connected")
+        }
         ServerOnly(packet_type: PacketType) {
             description("received packet which can only be sent by servers")
             display("received packet which can only be sent by servers: {}", packet_type)
