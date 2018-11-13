@@ -31,43 +31,52 @@ function jqtt_proto.dissector(buffer, pinfo, tree)
 		local p_type = bit.rshift(header, 3)
 		local seq = bit.band(header, 0x7)
 
+		local parsed = -1
 		if p_type == 0 and buffer:len() == 5 and buffer(0, 1):uint() == 0 and buffer(1, 4):string() == "JQTT" then
 			subtree:add(f_packet_type, p_type)
-			return 5
+			parsed = 5
 		elseif p_type == 1 and buffer:len() == 3 and seq < 2 then
 			subtree:add(f_packet_type, p_type)
 			subtree:add(f_keepalive, seq)
 			subtree:add(f_max_packet_size, buffer(1, 2))
-			return 1
+			parsed = 1
 		elseif p_type == 2 and buffer:len() == 1 and seq == 0 then
 			subtree:add(f_packet_type, p_type)
-			return 1
+			parsed = 1
 		elseif p_type == 3 and buffer:len() == 1 then
 			subtree:add(f_packet_type, p_type)
 			subtree:add(f_packet_seq, seq)
-			return 1
+			parsed = 1
 		elseif p_type == 4 and buffer:len() == 1 then
 			subtree:add(f_packet_type, p_type)
 			subtree:add(f_packet_seq, seq)
-			return 1
+			parsed = 1
 		elseif p_type == 5 or p_type == 6 and buffer:len() > 1 then
 			subtree:add(f_packet_type, p_type)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_topic_name, buffer(1, buffer:len() - 1))
-			return buffer:len()
+			parsed = buffer:len()
 		elseif p_type == 7 and buffer:len() > 9 then
 			subtree:add(f_packet_type, p_type)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_message_id, buffer(1, 4))
 			subtree:add(f_message_size, buffer(5, 4))
 			subtree:add(f_topic_name, buffer(9, buffer:len() - 9))
-			return buffer:len()
+			parsed = buffer:len()
 		elseif p_type == 8 and buffer:len() > 5 then
 			subtree:add(f_packet_type, p_type)
 			subtree:add(f_packet_seq, seq)
 			subtree:add(f_message_id, buffer(1, 4))
 			subtree:add(f_message_payload, buffer(5, buffer:len() - 5))
-			return buffer:len()
+			parsed = buffer:len()
+		end
+
+		if parsed ~= -1 then
+			pinfo.cols.info:set(pinfo.src_port .. " -> " .. pinfo.dst_port)
+			pinfo.cols.info:append(" ["..packet_types[p_type].."]")
+			if p_type >= 3 then
+				pinfo.cols.info:append(", seq = "..seq)
+			end
 		end
 	end
 
