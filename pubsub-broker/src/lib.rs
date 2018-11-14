@@ -27,9 +27,9 @@ extern crate pubsub_common as common;
 use bytes::{BufMut, Bytes};
 use crossbeam::queue::MsQueue;
 
+pub use common::util;
 use common::constants;
 use common::util::BufferProvider;
-pub use common::util::default_packet_size;
 use common::timer::TimerManager;
 use common::packet::PacketType;
 use common::protocol::Timeout;

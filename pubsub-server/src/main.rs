@@ -1,11 +1,9 @@
 #![feature(wait_until)]
 
 use std::error::Error as StdError;
-use std::fmt::Display;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, Condvar};
 use std::process;
-use std::net::{AddrParseError, IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 
 #[macro_use]
 extern crate log;
@@ -17,6 +15,7 @@ extern crate pubsub_broker;
 
 use simplelog::{LevelFilter, TermLogger};
 
+use pubsub_broker::util;
 use pubsub_broker::Broker;
 
 pub struct Config {
@@ -41,16 +40,10 @@ impl Default for Config {
 }
 impl<'a> From<clap::ArgMatches<'a>> for Config {
     fn from(args: clap::ArgMatches) -> Config {
-        let log_level = match args.occurrences_of("verbose") {
-            0 => LevelFilter::Info,
-            1 => LevelFilter::Debug,
-            2 | _ => LevelFilter::Trace,
-        };
-
         Config {
-            log_level,
+            log_level: util::verbosity_to_log_level(args.occurrences_of("verbose") as usize),
 
-            bind_addrs: args.values_of("bind_addrs").unwrap().map(parse_addr).map(|r| r.unwrap()).flatten().collect(),
+            bind_addrs: args.values_of("bind_addrs").unwrap().map(util::parse_addr).map(|r| r.unwrap()).flatten().collect(),
             threads: args.value_of("threads").unwrap().parse().unwrap(),
             enable_keepalive: !args.is_present("disable_keepalive"),
             packet_size: args.value_of("packet_size").unwrap().parse().unwrap(),
@@ -63,16 +56,6 @@ impl Config {
     }
 }
 
-fn parse_addr(addr: &str) -> Result<std::vec::IntoIter<SocketAddr>, AddrParseError> {
-    if let Ok(a) = addr.to_socket_addrs() {
-        return Ok(a);
-    }
-
-    Ok(vec![(addr.parse::<IpAddr>()?, 26999).into()].into_iter())
-}
-fn validate_parse<V: FromStr<Err = E>, E: Display>(val: String) -> Result<(), String> {
-    val.parse::<V>().map(|_| ()).map_err(|e| format!("{}", e))
-}
 fn args<'a>() -> clap::ArgMatches<'a> {
     clap::App::new("JQTT broker")
         .version("0.1")
@@ -90,7 +73,7 @@ fn args<'a>() -> clap::ArgMatches<'a> {
              .use_delimiter(true)
              .default_value("localhost:26999")
              .takes_value(true)
-             .validator(|val| parse_addr(&val).map(|_| ()).map_err(|e| format!("{}", e))))
+             .validator(|val| util::parse_addr(&val).map(|_| ()).map_err(|e| format!("{}", e))))
         .arg(clap::Arg::with_name("threads")
              .short("t")
              .long("threads")
@@ -99,7 +82,7 @@ fn args<'a>() -> clap::ArgMatches<'a> {
              .default_value("0")
              .hide_default_value(true)
              .takes_value(true)
-             .validator(validate_parse::<u16, _>))
+             .validator(util::validate_parse::<u16, _>))
         .arg(clap::Arg::with_name("disable_keepalive")
              .long("disable-keepalive")
              .help("Disable keepalive"))
@@ -110,7 +93,7 @@ fn args<'a>() -> clap::ArgMatches<'a> {
              .default_value("0")
              .hide_default_value(true)
              .takes_value(true)
-             .validator(validate_parse::<u16, _>))
+             .validator(util::validate_parse::<u16, _>))
         .get_matches()
 }
 fn run(config: Config) -> Result<(), Box<dyn StdError>> {

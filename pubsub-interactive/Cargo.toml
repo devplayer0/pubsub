@@ -5,3 +5,8 @@ authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+quick-error = "~1.2"
+clap = "~2.32"
+ctrlc = { version = "~3.0", features = [ "termination" ] }
+cursive = { version = "~0.9" }
+pubsub-client = { path = "../pubsub-client" }

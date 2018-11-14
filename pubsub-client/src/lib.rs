@@ -13,14 +13,18 @@ extern crate quick_error;
 extern crate debug_stub_derive;
 #[macro_use]
 extern crate log;
-extern crate bytes;
+extern crate bytes as bytes_crate;
 extern crate crossbeam;
 
 extern crate pubsub_common as common;
 
+pub mod bytes {
+    pub use bytes_crate::*;
+}
 use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam::queue::MsQueue;
 
+pub use common::util;
 use common::constants;
 use common::util::BufferProvider;
 pub use common::timer::TimerManager;
@@ -100,7 +104,7 @@ quick_error! {
         Shutdown {
             description("client is shut down")
         }
-        Std(err: Box<StdError>) {
+        Std(err: Box<StdError + Send + Sync + 'static>) {
             from()
             display("{}", err)
             description(err.description())
@@ -395,6 +399,10 @@ impl<'a> Client<'a> {
         })
     }
     pub fn stop(self) {
+        if !self.running.load(Ordering::SeqCst) {
+            return;
+        }
+
         self.running.store(false, Ordering::SeqCst);
         self.io_thread.join().unwrap();
 

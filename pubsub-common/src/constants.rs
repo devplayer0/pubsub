@@ -11,5 +11,6 @@ pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 pub const CONNECT_RETRIES: u8 = 5;
 
+pub const DEFAULT_PORT: u16 = 26999;
 pub const CONNECT_MAGIC: &'static [u8] = b"JQTT";
 

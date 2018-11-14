@@ -1,8 +1,11 @@
 use std::cmp;
+use std::fmt::Display;
+use std::str::FromStr;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
-use std::net::SocketAddr;
+use std::net::{IpAddr, AddrParseError, ToSocketAddrs, SocketAddr};
 
+use log::LevelFilter;
 use bytes::BytesMut;
 
 use constants;
@@ -17,6 +20,24 @@ pub fn default_packet_size(addr: SocketAddr) -> u16 {
 #[inline]
 pub fn max_topic_len(max_packet_size: u16) -> u16 {
     max_packet_size - 1 - size_of::<u32>() as u16 - size_of::<u32>() as u16
+}
+
+pub fn verbosity_to_log_level(verbosity: usize) -> LevelFilter {
+    match verbosity {
+        0 => LevelFilter::Info,
+        1 => LevelFilter::Debug,
+        2 | _ => LevelFilter::Trace,
+    }
+}
+pub fn parse_addr(addr: &str) -> Result<std::vec::IntoIter<SocketAddr>, AddrParseError> {
+    if let Ok(a) = addr.to_socket_addrs() {
+        return Ok(a);
+    }
+
+    Ok(vec![(addr.parse::<IpAddr>()?, constants::DEFAULT_PORT).into()].into_iter())
+}
+pub fn validate_parse<V: FromStr<Err = E>, E: Display>(val: String) -> Result<(), String> {
+    val.parse::<V>().map(|_| ()).map_err(|e| format!("{}", e))
 }
 
 #[derive(Debug)]

@@ -10,7 +10,6 @@ extern crate enum_primitive;
 extern crate debug_stub_derive;
 #[macro_use]
 extern crate quick_error;
-#[macro_use]
 extern crate log;
 extern crate bytes;
 extern crate priority_queue;
