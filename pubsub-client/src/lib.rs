@@ -1,4 +1,5 @@
 use std::error::Error as StdError;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::atomic::{Ordering, AtomicBool};
 use std::time::{Duration, Instant};
@@ -74,6 +75,14 @@ quick_error! {
         ReceivedDisconnect {
             description("received disconnect packet from server")
         }
+        AlreadySubscribed(topic: String) {
+            description("already subscribed")
+            display("already subscribed to {}", topic)
+        }
+        NotSubscribed(topic: String) {
+            description("not subscribed")
+            display("not subscribed to {}", topic)
+        }
         InvalidPublishState(id: u32, started: bool) {
             description("incorrect type of incoming message packet for current state")
             display("incoming message {} {} started", id, match started {
@@ -84,9 +93,6 @@ quick_error! {
         MessageTooBig(expected: u32, actual: u32) {
             description("message is bigger than specified")
             display("message is {} bytes, specified as {}", actual, expected)
-        }
-        MessageAlreadyQueued {
-            description("a message is already queued for publishing")
         }
         Interrupted {
             description("action interrupted by shutdown")
@@ -187,6 +193,7 @@ pub struct Client<'a> {
 
     acked_pid: Arc<(Mutex<usize>, Condvar)>,
     send_space: Arc<(Mutex<usize>, Condvar)>,
+    subscriptions: HashSet<String>,
     next_msg_id: u32,
     #[debug_stub = "VecDeque<OutgoingMessage>"]
     messages: Vec<OutgoingMessage<'a>>,
@@ -382,6 +389,7 @@ impl<'a> Client<'a> {
 
             acked_pid,
             send_space,
+            subscriptions: HashSet::new(),
             next_msg_id: 0,
             messages: Vec::new(),
         })
@@ -394,25 +402,33 @@ impl<'a> Client<'a> {
         self.inner_thread.join().unwrap();
     }
 
-    pub fn subscribe(&self, topic: &str) -> Result<(), Error> {
+    pub fn subscribe(&mut self, topic: &str) -> Result<(), Error> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(Error::Shutdown);
+        }
+        if self.subscriptions.contains(topic) {
+            return Err(Error::AlreadySubscribed(topic.to_owned()));
         }
         await_sendbuf_space!(self.send_space, self.running);
 
         let pid = self.protocol.lock().unwrap().send_subscribe(topic, self.max_packet_size)?;
         await_packet_ack!(self.acked_pid, self.running, pid);
+        self.subscriptions.insert(topic.to_owned());
 
         Ok(())
     }
-    pub fn unsubscribe(&self, topic: &str) -> Result<(), Error> {
+    pub fn unsubscribe(&mut self, topic: &str) -> Result<(), Error> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(Error::Shutdown);
+        }
+        if !self.subscriptions.contains(topic) {
+            return Err(Error::NotSubscribed(topic.to_owned()));
         }
         await_sendbuf_space!(self.send_space, self.running);
 
         let pid = self.protocol.lock().unwrap().send_unsubscribe(topic, self.max_packet_size)?;
         await_packet_ack!(self.acked_pid, self.running, pid);
+        self.subscriptions.remove(topic);
 
         Ok(())
     }
