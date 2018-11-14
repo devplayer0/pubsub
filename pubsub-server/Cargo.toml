@@ -1,5 +1,5 @@
 [package]
-name = "pubsub-broker-server"
+name = "pubsub-server"
 version = "0.1.0"
 authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
 
