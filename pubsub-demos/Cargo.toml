@@ -1,0 +1,11 @@
+[package]
+name = "pubsub-demos"
+version = "0.1.0"
+authors = ["Jack O'Sullivan <jackos1998@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+log = "~0.4"
+simplelog = "~0.5"
+rand = "~0.6"
+pubsub-client = { path = "../pubsub-client" }
