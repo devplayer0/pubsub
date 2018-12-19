@@ -1,0 +1,303 @@
+\documentclass[a4paper]{article}
+
+\usepackage[a4paper,margin=2cm]{geometry}
+\usepackage{amsmath}
+\usepackage[table]{xcolor}
+\usepackage{tikz}
+\usepackage[clock]{ifsym}
+\usepackage{subcaption} % subfigures
+\usepackage{hyperref} % links in table of contents
+\usepackage[strings]{underscore}
+\usepackage[sorting=none]{biblatex}
+
+\usetikzlibrary{calc,positioning,arrows.meta}
+
+\hypersetup{
+	colorlinks,
+	citecolor=black,
+	filecolor=black,
+	linkcolor=black,
+	urlcolor=black
+}
+\numberwithin{figure}{section}
+\numberwithin{table}{section}
+\renewcommand{\arraystretch}{1.5}
+
+\newcommand{\NA}{---}
+
+\title{CS2031 - Assignment 1\\MQTT}
+\date{2018-12-15}
+\author{\url{https://git.nul.ie/dev/pubsub}\\\url{https://github.com/devplayer0/pubsub}\\Jack O'Sullivan\\\href{mailto:osullj19@tcd.ie}{osullj19@tcd.ie}}
+\bibliography{bibliography}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\pagenumbering{gobble}
+
+\newpage
+\pagenumbering{arabic}
+\section{Introduction}
+\subsection{Objective}
+The goal of this assignment was to develop an implementation of an MQTT-like protocol making use of some kind of Flow Control.
+
+Classic MQTT is implemented with TCP, which means it is guaranteed to deliver messages (in order). However, this can pose issues for embedded devices with limited resources, since TCP has some non-trivial overhead. Considering that MQTT publishers are often simple, low-power sensors - this problem is amplified.
+For example, the ESP8266, a popular low-cost WiFi-enabled microcontroller \cite{esp8266} has a very small amount of memory (reduced even more once firmware is loaded \cite{esp8266-lowmem}).
+
+\medskip
+By designing a custom protocol with simple flow control (to ensure at least some degree of reliability), it should be more suitable for low-power devices. UDP, which is a relatively thin layer on top of a network-layer protocol like IPv4 or IPv6 (adding only source and destination port numbers along with a checksum) should be suitable.
+
+\subsection{Flow control and error control}
+In order to build a reliable communication channel on top of UDP, some kind of flow control is required. Flow control essentially places a limit on the amount of data that be sent before the receiver acknowledges receipt of the data. Some kind of error control is also usually employed to manage out-of-order or dropped packets.
+
+For the purposes of this report, Selective-Repeat ARQ will not be discussed since it was not implemented by the solution for this assignment.
+
+\subsubsection{Communication without flow control}
+To understand the need for flow control and error control, it helps to examine the problems encountered when not using any.
+\begin{figure}[h!]
+	\centering
+	\begin{tikzpicture}
+		\draw[dashed] (-3,0) -- (-3,-5) (3,0) -- (3,-5);
+		\node at (-3,.3) {Sender};
+		\node at (3,.3) {Receiver};
+
+		\draw[-Latex] (-3,-1) -- node[midway,above=.5em] {Packet} (3,-2);
+		\draw[-Latex] (-3,-2) -- node[midway,above=.5em] {Packet} (3,-3);
+		\draw[-Latex] (-3,-3) -- node[midway,above=.5em] {Packet} (3,-4);
+	\end{tikzpicture}
+	\caption{No flow control: normal scenario}
+	\label{fig:noflow-ok}
+\end{figure}
+
+\newpage
+In Figure~\ref{fig:noflow-ok}, packets are delivered in order without any form of flow control, so clearly some form of communication is possible. However, as soon as any kind of errors appear (such as lost packets or out of order delivery), this quickly falls apart:
+
+\begin{figure}[h!]
+	\centering
+	\begin{subfigure}[b][6cm][s]{.45\textwidth}
+		\centering
+		\begin{tikzpicture}
+			\draw[dashed] (-3,0) -- (-3,-5) (3,0) -- (3,-5);
+			\node at (-3,.3) {Sender};
+			\node at (3,.3) {Receiver};
+
+			\draw[-Latex] (-3,-1) -- node[midway,above=.5em] {Packet} (3,-2);
+			\draw[color=red, dash pattern=on 130pt off 99pt] (-3,-2) -- node[midway,above=.5em] {Packet} (3,-3);
+			\node[color=red] at ($(-3,-2)!135pt!(3,-3)$) {$\times$};
+
+			\draw[-Latex] (-3,-3) -- node[midway,above=.5em] {Packet} (3,-4);
+		\end{tikzpicture}
+		\caption{Lost packet}
+		\label{fig:noflow-lost}
+	\end{subfigure}
+	\begin{subfigure}[b][6cm][s]{.45\textwidth}
+		\begin{tikzpicture}
+			\draw[dashed] (-3,0) -- (-3,-5) (3,0) -- (3,-5);
+			\node at (-3,.3) {Sender};
+			\node at (3,.3) {Receiver};
+
+			\draw[-Latex] (-3,-1) -- node[midway,above=.5em] {Packet} (3,-2);
+			\draw[-Latex] (-3,-2) -- node[midway,above=.5em] {Packet} (3,-4.5);
+			\draw[-Latex, color=red] (-3,-3) -- node[midway,below=.5em] {Packet} (3,-3.5);
+		\end{tikzpicture}
+		\caption{Out of order delivery}
+		\label{fig:noflow-ood}
+	\end{subfigure}
+	\caption{No flow control: error scenarios}
+	\label{fig:noflow-errors}
+\end{figure}
+
+Figure~\ref{fig:noflow-lost} shows the second packet being dropped on its way to the receiver. There are a number of reasons that this could have happened (eg. packet contents too large for MTU). Regardless, the receiver will lose the data in the second packet completely and accept the third in its place. The receiver will always be 1 packet behind!
+
+In Figure~\ref{fig:noflow-ood}, all of the packets are still delivered, but the third packet arrives before the second. Any switch / router between the sender and receiver could have caused the re-ordering for any reason, but since there is no way for the receiver to tell that it has received the third packet before the second, it will just accept the (most likely) invalid data in place of both the second and third packets.
+
+\subsubsection{Stop-and-Wait}
+Essentially the most simple form of flow control, Stop-and-Wait adds a an ACK (or acknowledgement) packet that the receiver must send in response to every sender packet \textbf{before the sender can continue}.
+\begin{figure}[h!]
+	\centering
+	\begin{tikzpicture}
+		\draw[dashed] (-3,0) -- (-3,-5.5) (3,0) -- (3,-5.5);
+		\node at (-3,.3) {Sender};
+		\node at (3,.3) {Receiver};
+
+		\draw[-Latex] (-3,-.5) -- node[midway,above=.3em] {Packet} (3,-1);
+		\draw[-Latex, dashed] (3,-1) -- node[midway,below=.3em] {ACK} (-3,-1.5);
+
+		\draw[-Latex] (-3,-2.25) -- node[midway,above=.3em] {Packet} (3,-2.75);
+		\draw[-Latex, dashed] (3,-2.75) -- node[midway,below=.3em] {ACK} (-3,-3.25);
+
+		\draw[-Latex] (-3,-4) -- node[midway,above=.3em] {Packet} (3,-4.5);
+		\draw[-Latex, dashed] (3,-4.5) -- node[midway,below=.3em] {ACK} (-3,-5);
+	\end{tikzpicture}
+	\caption{Stop-and-Wait}
+	\label{fig:saw-ok}
+\end{figure}
+
+This is \textbf{flow control}: the sender can't push data down the pipe faster than the receiver can read it because it needs to wait for the ACK. Stop-and-Wait is \textit{not} error control, however:
+\begin{itemize}
+	\item In the case of lost packets (data or ACK), the sender will hang waiting for the client forever (to send an ACK for an unreceived packet or to re-send a dropped ACK) [Figure~\ref{fig:noflow-lost}]
+	\item For packets delivered out of order, the receiver still can't tell that it has received incorrect data [Figure~\ref{fig:noflow-ood}]
+\end{itemize}
+
+\newpage
+\subsubsection{Stop-and-Wait ARQ}
+Stop-and-Wait ARQ (automatic repeat request) adds error control to Stop-and-Wait in order to solve the error scenarios in Figure~\ref{fig:noflow-errors}. This comes in the form of:
+\begin{itemize}
+	\item A 1-bit ``sequence number'' for packets and corresponding ACK's
+	\item Sender timeouts: if an appropriate ACK is not received within a certain amount of time, re-send the last packet
+\end{itemize}
+
+\begin{figure}[h!]
+	\centering
+	\begin{tikzpicture}
+		\draw[dashed] (-3,0) -- (-3,-5.5) (3,0) -- (3,-5.5);
+		\node at (-3,.3) {Sender};
+		\node at (3,.3) {Receiver};
+
+		\draw[-Latex] (-3,-.5) -- node[midway,above=.3em] {Packet 0} (3,-1);
+		\draw[-Latex, dashed] (3,-1) -- node[midway,below=.3em] {ACK 0} (-3,-1.5);
+
+		\draw[-Latex] (-3,-2.25) -- node[midway,above=.3em] {Packet 1} (3,-2.75);
+		\draw[-Latex, dashed] (3,-2.75) -- node[midway,below=.3em] {ACK 1} (-3,-3.25);
+
+		\draw[-Latex] (-3,-4) -- node[midway,above=.3em] {Packet 0} (3,-4.5);
+		\draw[-Latex, dashed] (3,-4.5) -- node[midway,below=.3em] {ACK 0} (-3,-5);
+	\end{tikzpicture}
+	\caption{Stop-and-Wait ARQ: normal scenario}
+	\label{fig:sawe-ok}
+\end{figure}
+
+As can be seen in Figure~\ref{fig:sawe-ok}, Stop-and-Wait ARQ looks very similar to plain Stop-and-Wait (without errors). The sender still waits for an ACK from the receiver before sending another data packet. However, Stop-and-Wait ARQ allows for dropped packets (either data or ACK's) to be recovered from:
+\begin{figure}[h!]
+	\centering
+	\begin{subfigure}[b][6.5cm][s]{.45\textwidth}
+		\centering
+		\begin{tikzpicture}
+			\draw[dashed] (-3,0) -- (-3,-5.5) (3,0) -- (3,-5.5);
+			\node at (-3,.3) {Sender};
+			\node at (3,.3) {Receiver};
+
+			\draw[-Latex] (-3,-.5) -- node[midway,above=.3em] {Packet 0} (3,-1);
+			\draw[-Latex, dashed] (3,-1) -- node[midway,below=.3em] {ACK 0} (-3,-1.5);
+
+			\draw[color=red, dash pattern=on 130pt off 99pt] (-3,-2.25) -- node[midway,above=.3em] {Packet 1} (3,-2.75);
+			\node[color=red] at ($(-3,-2.25)!135pt!(3,-2.75)$) {$\times$};
+
+			\node[anchor=east] at (-3,-3) {\large \showclock{0}{15}};
+			\draw[-Latex] (-3,-3) -- node[midway,above=.3em] {Packet 1} (3,-3.5);
+			\draw[-Latex, dashed] (3,-3.5) -- node[midway,below=.3em] {ACK 1} (-3,-4);
+		\end{tikzpicture}
+		\caption{Lost packet}
+		\label{fig:sawe-lost}
+	\end{subfigure}
+	\begin{subfigure}[b][6.5cm][s]{.45\textwidth}
+		\begin{tikzpicture}
+			\draw[dashed] (-3,0) -- (-3,-5.5) (3,0) -- (3,-5.5);
+			\node at (-3,.3) {Sender};
+			\node at (3,.3) {Receiver};
+
+			\draw[-Latex] (-3,-.5) -- node[midway,above=.3em] {Packet 0} (3,-1);
+			\draw[-Latex, dashed] (3,-1) -- node[midway,below=.3em] {ACK 0} (-3,-1.5);
+
+			\draw[-Latex] (-3,-2.25) -- node[midway,above=.3em] {Packet 1} (3,-2.75);
+			\draw[color=red, dash pattern=on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 99pt] (3,-2.75) -- node[midway,below=.3em] {ACK 1} (-3,-3.25);
+			\node[color=red] at ($(3,-2.75)!129pt!(-3,-3.25)$) {$\times$};
+
+			\node[anchor=east] at (-3,-4) {\large \showclock{0}{15}};
+			\draw[-Latex] (-3,-4) -- node[midway,above=.3em] {Packet 1} (3,-4.5);
+			\node[anchor=west, draw=black] at (3,-4.5) {?};
+
+			\draw[-Latex, dashed] (3,-4.5) -- node[midway,below=.3em] {ACK 1} (-3,-5);
+		\end{tikzpicture}
+		\caption{Lost ACK}
+		\label{fig:sawe-lack}
+	\end{subfigure}
+	\caption{Stop-and-Wait ARQ: dropped packet scenarios}
+\end{figure}
+
+Figure~\ref{fig:sawe-lost} shows Packet 1 never reaches the receiver. Since the receiver hasn't received Packet 1, it never sends an ACK. After a short time when the sender receives no ACK, it re-sends Packet 1 and upon receipt, the receiver sends an ACK and transmission continues.
+
+In Figure~\ref{fig:sawe-lack}, Packet 1 reaches the receiver, but the corresponding ACK doesn't reach the sender. From the sender's perspective, this is the same situation as in Figure~\ref{fig:sawe-lost}, so it re-sends Packet 1 after a short timeout. This is when the 1-bit sequence number comes into play. When the receiver reads the re-transmitted Packet 1, it \textit{discards its contents} (because it has already seen this data - it knows this because of the sequence number) and sends another ACK.
+
+\newpage
+\subsubsection{Go-Back-N ARQ}
+Although Stop-and-Wait ARQ can correct errors, it wastes bandwidth by allowing only a single data packet to be in-transit at once. Go-Back-N attempts to improve this through use of a sender ``sliding window''. Essentially, a sender can transmit up to $n$ packets (where $n$ is the window size) before needing to wait for the receiver to send an ACK.
+
+\begin{figure}[h!]
+	\centering
+	\begin{tikzpicture}
+		\draw[dashed] (-3,0) -- (-3,-6) (3,0) -- (3,-6);
+		\node at (-3,.3) {Sender};
+		\node at (3,.3) {Receiver};
+
+		\node[anchor=west] at (3,-.25) {\begin{tabular}{|c|}\hline \cellcolor{green!35}0 \\ \hline\end{tabular}};
+		\node[anchor=west] at (3,-1.75) {\begin{tabular}{|c|}\hline \cellcolor{green!35}1 \\ \hline\end{tabular}};
+		\node[anchor=west] at (3,-3.25) {\begin{tabular}{|c|}\hline \cellcolor{green!35}2 \\ \hline\end{tabular}};
+		\node[anchor=west] at (3,-5) {\begin{tabular}{|c|}\hline \cellcolor{green!35}3 \\ \hline\end{tabular}};
+
+		\draw[-Latex] (-3,-.75) -- node[midway,above=.3em] {Packet 0} (3,-1.25);
+
+		\draw[-Latex] (-3,-2.25) -- node[midway,above=.3em] {Packet 1} (3,-2.75);
+		\draw[-Latex, dashed] (3,-2.75) -- node[midway,below=.3em] {ACK 1} (-3,-3.25);
+
+		\draw[-Latex] (-3,-4) -- node[midway,above=.3em] {Packet 2} (3,-4.5);
+		\draw[-Latex, dashed] (3,-4.5) -- node[midway,below=.3em] {ACK 2} (-3,-5);
+
+		\node[anchor=east] at (-3,-.25) {\begin{tabular}{|c|c|c|c|c|c|}\hline \cellcolor{blue!35}0&\cellcolor{blue!35}1&\cellcolor{blue!35}2&3&0&1 \\ \hline\end{tabular}};
+		\node[anchor=east] at (-3,-3.6) {\begin{tabular}{|c|c|c|c|c|c|}\hline 0&1&\cellcolor{blue!35}2&\cellcolor{blue!35}3&\cellcolor{blue!35}0&1 \\ \hline\end{tabular}};
+		\node[anchor=east] at (-3,-5.35) {\begin{tabular}{|c|c|c|c|c|c|}\hline 0&1&2&\cellcolor{blue!35}3&\cellcolor{blue!35}0&\cellcolor{blue!35}1 \\ \hline\end{tabular}};
+	\end{tikzpicture}
+	\caption{Go-Back-N ARQ: normal scenario}
+	\label{fig:gbn-ok}
+\end{figure}
+
+The blue shaded numbers in Figure~\ref{fig:gbn-ok} represent the current send window - when an ACK is received the window shifts forward past the number in the ACK packet. This means that not every packet \textit{has} to be acknowledged. Also of note is the fact that the size of the window is 1 less than the highest sequence number. This is important for handling errors. The window size can therefore be calculated as $2^m - 1$ where $m$ is the number of bits used for the sequence number.
+
+The green shaded numbers on the right represent the receiver ``window''. This is the only sequence number packet that the receiver will accept at that point, others will be ignored. On receipt of a packet, this number is incremented (wrapping around of course) and an acknowledgement packet is usually sent.
+
+\medskip
+If data packets or ACK's are lost, after a short timeout the sender will re-send all of the packets in the current send window (similarly to Stop-and-Wait ARQ). The requirement for $w = 2^m - 1$ can be understood by looking at the following error scenario:
+\begin{figure}[h!]
+	\centering
+	\begin{tikzpicture}
+		\draw[dashed] (-3,0) -- (-3,-7.25) (3,0) -- (3,-7.25);
+		\node at (-3,.3) {Sender};
+		\node at (3,.3) {Receiver};
+
+		\node[anchor=west] at (3,-.25) {\begin{tabular}{|c|}\hline \cellcolor{green!35}2 \\ \hline\end{tabular}};
+		\node[anchor=west] at (3,-1.75) {\begin{tabular}{|c|}\hline \cellcolor{green!35}3 \\ \hline\end{tabular}};
+		\node[anchor=west] at (3,-6.75) {\begin{tabular}{|c|}\hline \cellcolor{green!35}0 \\ \hline\end{tabular}};
+
+		\draw[-Latex] (-3,-.75) -- node[midway,above=.3em] {Packet 2} (3,-1.25);
+		\draw[color=red, dash pattern=on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 3pt on 3pt off 99pt] (3,-1.25) -- node[midway,below=.3em] {ACK 2} (-3,-1.75);
+		\node[color=red] at ($(3,-1.25)!129pt!(-3,-1.75)$) {$\times$};
+
+		\node[anchor=east] at (-3,-2.5) {\large \showclock{0}{15}};
+		\draw[-Latex] (-3,-2.5) -- node[midway,above=.3em] {Packet 0} (3,-3);
+		\draw[-Latex] (-3,-3.25) -- node[midway,above=.3em] {Packet 1} (3,-3.75);
+		\draw[-Latex] (-3,-4) -- node[midway,above=.3em] {Packet 2} (3,-4.5);
+		\draw[-Latex, dashed] (3,-4.5) -- node[midway,below=.3em] {ACK 2} (-3,-5);
+
+		\draw[-Latex] (-3,-5.75) -- node[midway,above=.3em] {Packet 3} (3,-6.25);
+
+		\node[anchor=east] at (-3,-.25) {\begin{tabular}{|c|c|c|c|c|c|}\hline \cellcolor{blue!35}0&\cellcolor{blue!35}1&\cellcolor{blue!35}2&3&0&1 \\ \hline\end{tabular}};
+		\node[anchor=east] at (-3,-5.35) {\begin{tabular}{|c|c|c|c|c|c|}\hline 0&1&2&\cellcolor{blue!35}3&\cellcolor{blue!35}0&\cellcolor{blue!35}1 \\ \hline\end{tabular}};
+	\end{tikzpicture}
+	\caption{Go-Back-N ARQ: many ACK's lost}
+	\label{fig:gbn-bad}
+\end{figure}
+
+\newpage
+In Figure~\ref{fig:gbn-bad}, it can be assumed that the sender has sent packets 0 and 1 (with no ACK from the receiver) before this diagram starts.
+
+When the sender fails to receive any acknowledgement, it re-sends all of the packets in the window as described above. The receiver's expected packet doesn't change since it has already received packets 0 to 2, but it sends an ACK at the end. Note that if the packets 0 through 3 had been sent without acknowledgement (and re-sent again after a timeout), the receiver would have wrapped around and \textbf{accept the the re-sent packets as new data}!
+
+\section{Implementation}
+
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{References}
+\printbibliography
+
+\end{document}
+# vim: nofoldenable
