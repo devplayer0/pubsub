@@ -28,8 +28,8 @@ function jqtt_proto.dissector(buffer, pinfo, tree)
 	local subtree = tree:add(jqtt_proto, buffer(), "JQTT")
 	if buffer:len() >= 1 then
 		local header = buffer(0, 1):uint()
-		local p_type = bit.rshift(header, 3)
-		local seq = bit.band(header, 0x7)
+		local p_type = bit.rshift(header, 4)
+		local seq = bit.band(header, 0xf)
 
 		local parsed = -1
 		if p_type == 0 and buffer:len() == 5 and buffer(0, 1):uint() == 0 and buffer(1, 4):string() == "JQTT" then
