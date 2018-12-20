@@ -77,6 +77,8 @@ function jqtt_proto.dissector(buffer, pinfo, tree)
 			if p_type >= 3 then
 				pinfo.cols.info:append(", seq = "..seq)
 			end
+
+			return parsed
 		end
 	end
 
