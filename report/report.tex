@@ -4,6 +4,7 @@
 \usepackage{amsmath}
 \usepackage[table]{xcolor}
 \usepackage{tikz}
+\usepackage{minted}
 \usepackage[clock]{ifsym}
 \usepackage{subcaption} % subfigures
 \usepackage{hyperref} % links in table of contents
@@ -23,6 +24,7 @@
 \numberwithin{table}{section}
 \renewcommand{\arraystretch}{1.5}
 
+\newcommand{\mi}{\mintinline}
 \newcommand{\NA}{---}
 
 \title{CS2031 - Assignment 1\\MQTT}
@@ -293,6 +295,24 @@ In Figure~\ref{fig:gbn-bad}, it can be assumed that the sender has sent packets 
 When the sender fails to receive any acknowledgement, it re-sends all of the packets in the window as described above. The receiver's expected packet doesn't change since it has already received packets 0 to 2, but it sends an ACK at the end. Note that if the packets 0 through 3 had been sent without acknowledgement (and re-sent again after a timeout), the receiver would have wrapped around and \textbf{accept the the re-sent packets as new data}!
 
 \section{Implementation}
+The implementation of the assignment is called ``JQTT'' (Jack's Queueing Telemetry Transport).
+\subsection{Design choices / features}
+\begin{itemize}
+	\item Rust was used as the main language for its high-level features combined with high performance \cite{rust-lang}
+	\item The assignment was split into a number of subprojects:
+		\begin{itemize}
+			\item \mi{c}{pubsub-broker}: JQTT broker library
+			\item \mi{c}{pubsub-client}: JQTT publisher / subscriber library
+			\item \mi{c}{pubsub-common}: Common code used by broker / client
+			\item \mi{c}{pubsub-server}: Command line application which starts a broker using the \mi{c}{pubsub-broker} library
+			\item \mi{c}{pubsub-client}: Interactive client demo with publish / subscribe in an \mi{c}{ncurses}-like UI
+			\item \mi{c}{pubsub-demos}: Additional mini command line demos
+		\end{itemize}
+	\item Go-Back-N was used as the flow control method of choice
+	\item Messages can (in theory) be up to 4GB (32-bit) in size thanks to multi-packet messages
+	\item More than one multi-packet message can be in-flight at a time
+	\item A Wireshark dissector was written for the wire protocol to make debugging easier
+\end{itemize}
 
 \clearpage
 \phantomsection
