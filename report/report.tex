@@ -11,7 +11,7 @@
 \usepackage[strings]{underscore}
 \usepackage[sorting=none]{biblatex}
 
-\usetikzlibrary{calc,positioning,arrows.meta}
+\usetikzlibrary{calc,positioning,arrows.meta,decorations.pathreplacing}
 
 \hypersetup{
 	colorlinks,
@@ -308,11 +308,44 @@ The implementation of the assignment is called ``JQTT'' (Jack's Queueing Telemet
 			\item \mi{c}{pubsub-client}: Interactive client demo with publish / subscribe in an \mi{c}{ncurses}-like UI
 			\item \mi{c}{pubsub-demos}: Additional mini command line demos
 		\end{itemize}
-	\item Go-Back-N was used as the flow control method of choice
+	\item Go-Back-N was used as the flow control method of choice (with a window size of 15)
 	\item Messages can (in theory) be up to 4GB (32-bit) in size thanks to multi-packet messages
 	\item More than one multi-packet message can be in-flight at a time
 	\item A Wireshark dissector was written for the wire protocol to make debugging easier
 \end{itemize}
+
+\subsection{Protocol}
+The JQTT protocol is made up of 9 different packet types. Each is made up of a 1 byte header and (usually) some kind of payload. The header looks like this:
+
+\newcommand*{\tn}[2]{\tikz[baseline,remember picture]\node[inner sep=0pt,outer sep=2pt,anchor=base] (#1) {#2};}
+\begin{figure}[h!]
+	\centering
+	\begin{tabular}{|c|c|c|c|c|c|c|c|}
+		\hline
+		\cellcolor{red!30}\tn{type-start}{0} &\cellcolor{red!30}0&\cellcolor{red!30}1& \cellcolor{red!30}\tn{type-end}{1} & \cellcolor{blue!30}\tn{seq-start}{0} &\cellcolor{blue!30}1&\cellcolor{blue!30}0& \cellcolor{blue!30}\tn{seq-end}{0} \\
+		\hline
+	\end{tabular}
+
+	\begin{tikzpicture}[remember picture, overlay]
+		\draw[decorate, decoration={brace,amplitude=5pt,mirror,raise=5pt}] (type-start.south west) -- (type-end.south east) node[midway, below=10pt] {Type (\mi{c}{ACK})};
+		\draw[decorate, decoration={brace,amplitude=5pt,mirror,raise=5pt}] (seq-start.south west) -- (seq-end.south east) node[midway, below=10pt] {Sequence no. (\mi{c}{4})};
+	\end{tikzpicture}
+	\vspace*{10pt}
+	\caption{Header layout}
+	\label{fig:packet-header}
+\end{figure}
+
+Figure~\ref{fig:packet-header} shows the first four bits of the header represent the packet type (in the range \mi{c}{0} to \mi{c}{8} inclusive).
+
+The last 4 bits represent the sequence number of the packet, if relevant. In this example, the packet is an acknowledgement for the packet with sequence number 4. For unordered packets (such as \mi{c}{HEARTBEAT}), the contents of these bits is irrelevant.
+
+\subsubsection{Wireshark dissector}
+The Wireshark dissector for this assignment was written in Lua (see \mi{c}{wireshark_dissector.lua}). Drop it into the plugin folder of your local Wireshark installation (\mi{c}{~/.local/lib/wireshark/plugins} on Linux) to install it. When enabled, JQTT packets will be decoded:
+
+\subsubsection{\mi{c}{CONNECT}}
+The \mi{c}{CONNECT} packet is sent by any client (publisher / subscriber or both) to establish a ``connection'' state with a broker. The packet type is \mi{c}{0} and the sequence bits are unused. 4 magic bytes appear after the header in the form of the ASCII representation of the string ``JQTT''.
+
+In response to this packet the broker will send a \mi{c}{CONNACK} packet. After this the server will no longer accept \mi{c}{CONNECT} packets from this client until it disconnects or times out (if \mi{c}{keepalive} is enabled). If the client fails to receive a \mi{c}{CONNACK} response within a certain time, it will send another \mi{c}{CONNECT} packet (up to 5 times).
 
 \clearpage
 \phantomsection
