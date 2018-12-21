@@ -389,7 +389,7 @@ impl Jqtt {
                 _ => Err(Malformed(Connect)),
             },
             ConnAck => match data.remaining() {
-                2 if seq & 0b110 == 0 => Ok(Packet::ConnAck(match seq {
+                2 if seq & 0b1110 == 0 => Ok(Packet::ConnAck(match seq {
                     0 => false,
                     1 => true,
                     _ => panic!("impossible"),
