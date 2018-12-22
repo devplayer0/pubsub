@@ -2,6 +2,7 @@
 
 \usepackage[a4paper,margin=2cm]{geometry}
 \usepackage{amsmath}
+\usepackage{graphicx}
 \usepackage[table]{xcolor}
 \usepackage{tikz}
 \usepackage{minted}
@@ -12,6 +13,7 @@
 \usepackage[sorting=none]{biblatex}
 
 \usetikzlibrary{calc,positioning,arrows.meta,decorations.pathreplacing}
+\graphicspath{ {./graphics/} }
 
 \hypersetup{
 	colorlinks,
@@ -222,7 +224,7 @@ Figure~\ref{fig:sawe-lost} shows Packet 1 never reaches the receiver. Since the 
 In Figure~\ref{fig:sawe-lack}, Packet 1 reaches the receiver, but the corresponding ACK doesn't reach the sender. From the sender's perspective, this is the same situation as in Figure~\ref{fig:sawe-lost}, so it re-sends Packet 1 after a short timeout. This is when the 1-bit sequence number comes into play. When the receiver reads the re-transmitted Packet 1, it \textit{discards its contents} (because it has already seen this data - it knows this because of the sequence number) and sends another ACK.
 
 \newpage
-\subsubsection{Go-Back-N ARQ}
+\subsubsection{Go-Back-N ARQ} \label{sec:gbn}
 Although Stop-and-Wait ARQ can correct errors, it wastes bandwidth by allowing only a single data packet to be in-transit at once. Go-Back-N attempts to improve this through use of a sender ``sliding window''. Essentially, a sender can transmit up to $n$ packets (where $n$ is the window size) before needing to wait for the receiver to send an ACK.
 
 \begin{figure}[h!]
@@ -314,8 +316,8 @@ The implementation of the assignment is called ``JQTT'' (Jack's Queueing Telemet
 	\item A Wireshark dissector was written for the wire protocol to make debugging easier
 \end{itemize}
 
-\subsection{Protocol}
-The JQTT protocol is made up of 9 different packet types. Each is made up of a 1 byte header and (usually) some kind of payload. The header looks like this:
+\subsection{Protocol} \label{sec:protocol}
+The JQTT protocol is made up of 9 different packet types. Each is made up of a 1 byte header and (usually) some kind of payload. All integers are in network / big endian. The header looks like this:
 
 \newcommand*{\tn}[2]{\tikz[baseline,remember picture]\node[inner sep=0pt,outer sep=2pt,anchor=base] (#1) {#2};}
 \begin{figure}[h!]
@@ -339,13 +341,95 @@ Figure~\ref{fig:packet-header} shows the first four bits of the header represent
 
 The last 4 bits represent the sequence number of the packet, if relevant. In this example, the packet is an acknowledgement for the packet with sequence number 4. For unordered packets (such as \mi{c}{HEARTBEAT}), the contents of these bits is irrelevant.
 
+\newpage
 \subsubsection{Wireshark dissector}
 The Wireshark dissector for this assignment was written in Lua (see \mi{c}{wireshark_dissector.lua}). Drop it into the plugin folder of your local Wireshark installation (\mi{c}{~/.local/lib/wireshark/plugins} on Linux) to install it. When enabled, JQTT packets will be decoded:
+
+\begin{figure}[h!]
+	\centering
+	\includegraphics[width=\textwidth]{dissector}
+	\caption{JQTT packets decoded in Wireshark}
+	\label{fig:dissector}
+\end{figure}
+
+Figure~\ref{fig:dissector} shows JQTT packets decoded from raw UDP with detailed output. The filter field can be used to show only certain packets based on field values. In this example, \mi{c}{jqtt && !jqtt.type == HEARTBEAT} will show only JQTT packets that aren't of the \mi{c}{HEARTBEAT} type. Clicking on the 'Expression\dots' button and expanding the 'JQTT' tree will show possible field names and a brief explanation.
+
+The 'Info' column shows the source and destination port numbers, the packet type (in square brackets) and the sequence number (if applicable).
+
+Selecting a packet and expanding the JQTT section will show the packet type, sequence number as well as any packet-specific payload information. Clicking on a field will highlight the portion of the hex dump view its contents represents.
+
+\newpage
+\subsection{Packet types}
+As explained in section~\ref{sec:protocol}, there are 9 distinct pacet types in JQTT. The structure and purpose of each is explained in detail in this section (in order of the type number given to each; \mi{c}{CONNECT} is \mi{c}{0}, \mi{c}{CONNACK} is \mi{c}{1} etc.).
 
 \subsubsection{\mi{c}{CONNECT}}
 The \mi{c}{CONNECT} packet is sent by any client (publisher / subscriber or both) to establish a ``connection'' state with a broker. The packet type is \mi{c}{0} and the sequence bits are unused. 4 magic bytes appear after the header in the form of the ASCII representation of the string ``JQTT''.
 
 In response to this packet the broker will send a \mi{c}{CONNACK} packet. After this the server will no longer accept \mi{c}{CONNECT} packets from this client until it disconnects or times out (if \mi{c}{keepalive} is enabled). If the client fails to receive a \mi{c}{CONNACK} response within a certain time, it will send another \mi{c}{CONNECT} packet (up to 5 times).
+
+\subsubsection{\mi{c}{CONNACK}}
+Upon receiving a \mi{c}{CONNECT} packet from a client, the broker will send a \mi{c}{CONNACK} packet in reponse (as described above). It contains:
+\begin{itemize}
+	\item A flags bitfield (in place of the sequence number bits) - currently the only flag (the lowest bit) is whether the broker has \mi{c}{keepalive} mode enabled (see section~\ref{sec:heartbeat} on the \mi{c}{HEARTBEAT} packet)
+	\item A 16-bit unsigned integer representing the maximum packet size (including the 1 byte header) - this affects the packet types with variable length payloads
+\end{itemize}
+
+\subsubsection{\mi{c}{HEARTBEAT}} \label{sec:heartbeat}
+Under \mi{c}{keepalive} mode, clients must send a \mi{c}{HEARTBEAT} packet to the broker every few seconds. The server will respond to each \mi{c}{HEARTBEAT} packet with its own. If either the server or the client has not received a \mi{c}{HEARTBEAT} packet within the last 5 seconds, it will consider the peer as ``timed out'' and ``disconnect'' it (sending a \mi{c}{DISCONNECT} packet).
+
+In terms of structure, \mi{c}{HEARTBEAT} is very simple. It contains only the 1-byte JQTT header with all of the sequence bits set to 0 since it is not packet which needs to be delivered in the correct order (or at all, since it contains no information and another will take its place if lost).
+
+\subsubsection{\mi{c}{ACK}}
+The \mi{c}{ACK} packet simply fills the acknowledgement packet role required for Go-Back-N (as described in section~\ref{sec:gbn}). It is sent by both clients and the broker for all ordered packets.
+
+Like \mi{c}{HEARTBEAT}, \mi{c}{ACK} is consists of only the 1-byte header. The sequence bits represent the sequence number of the packet being acknowledged.
+
+\subsubsection{\mi{c}{DISCONNECT}}
+\mi{c}{DISCONNECT} can be sent to either clients or a broker to indicate that the ``connection'' between the two should be stopped. It can be sent for a variety of reasons:
+\begin{itemize}
+	\item A client is terminating and informs the server
+	\item The broker is terminating and is informing all clients
+	\item A client / broker timed out in \mi{c}{keepalive} mode
+	\item A malformed / invalid packet was received by a client or broker
+	\item There was an error sending a packet (e.g. operating system related)
+\end{itemize}
+
+This is another header-only packet. The sequence bits are used since \mi{c}{DISCONNECT} needs to be delivered reliably.
+
+\subsubsection{\mi{c}{SUBSCRIBE}}
+When a client wishes to subscribe to messages published to a topic, it sends a \mi{c}{SUBSCRIBE} packet. The broker will add the client to the list of subscribers for that topic and dispatch any messages that arrive \textit{after} subscribing (the broker will not dispatch messages to a subscriber that were published to a topic prior to subscription).
+
+\medskip
+\mi{c}{SUBSCRIBE} obviously makes use of the sequence bits since it should be delivered reliably. After the header, the remainder of the packet is a UTF-8 encoded string (\textbf{not} null-terminated). Since a UDP packet has a distinct size, the length of the string can be determined by subtracting 1 (for the header) from the UDP payload size.
+
+\medskip
+Note that the maximum packet length (as provided by the broker to clients in the \mi{c}{CONNACK} packet) determines the longest possible topic length! See section~\ref{sec:pubstart} for an explanation on how the maximum length of a topic string is calculated.
+
+\subsubsection{\mi{c}{UNSUBSCRIBE}}
+The \mi{c}{UNSUBSCRIBE} packet is very simple. When a broker receives this packet it will remove the client from the list of subscribers for that topic. The client will no longer receive any messages published to that topic. Its structure is identical to that of \mi{c}{SUBSCRIBE}.
+
+\subsubsection{\mi{c}{PUBLISH_START}} \label{sec:pubstart}
+This is one of the most important packets. \mi{c}{PUBLISH_START} contains information about a message which is about to me published in one or more \mi{c}{PUBLISH_DATA} packets. It can be sent by both clients \textit{and} brokers depending on the context:
+\begin{itemize}
+	\item Clients send this packet when they wish to publish a message to a topic
+	\item A broker will send this packet to all subscribers of a topic upon receiving a \mi{c}{PUBLISH_START} packet from a client (\textbf{with the exception of the publisher of the message})
+\end{itemize}
+
+\mi{c}{PUBLISH_START} contains 3 fields, they are (in order of appearance in the packet):
+\begin{itemize}
+	\item Message ID: A 32-bit unsigned integer which allows multiple messages to be ``in-flight'' simultaneously. Since message data is split across a multitude of \mi{c}{PUBLISH_DATA} packets, this is very useful (especially if a large message is in the process of being sent). Also of note is the fact that this ID is different based on who sent the packet. If it was sent by a client (asking a broker to publish a message to subscribers), it is unique to that client only. When a server is dispatching the \mi{c}{PUBLISH_START} to subscribers, it will overwrite the message ID with a value unique across all subscribers of all topics the broker holds.
+	\item Message size: Another 32-bit unsigned integer which indicates the size (in bytes) of the message payload (to be split across a number of \mi{c}{PUBLISH_DATA} packets)
+	\item Topic: This is a UTF-8 encoded string indicating the topic to which this message should be published. As with \mi{c}{SUBSCRIBE} and \mi{c}{UNSUBSCRIBE}, the length of this string is determined by the remaining bytes in the UDP payload. \textbf{The largest possible topic is determined by this packet - this applies to \mi{c}{SUBSCRIBE} and \mi{c}{UNSUBSCRIBE} too since a topic name could conceivably fit into these smaller packets but \underline{not} in a \mi{c}{PUBLISH_START} packet.}
+\end{itemize}
+
+\subsubsection{\mi{c}{PUBLISH_DATA}}
+Where \mi{c}{PUBLISH_START} starts the publishing process for a message, \mi{c}{PUBLISH_DATA} contains (at least some of) the actual message payload.
+
+Like \mi{c}{PUBLISH_START}, it can be sent by either the client (if that client is the one publishing the message) or a broker (distributing the message to subscribers on behalf of the publisher). This packet consists of two fields:
+\begin{itemize}
+	\item Message ID: A 32-bit unsigned integer which must match that of a preceding \mi{c}{PUBLISH_START} packet - if a data packet is sent without a start packet, the receiver will complain. The same applies if a data packet is sent and the total transmitted data for that message ID would exceed the value set in the initial \mi{c}{PUBLISH_START} packet.
+	\item Actual (partial) message payload: The remainder of the packet is data \textbf{of an arbitrary format}. A publisher will split the full payload into a number of \mi{c}{PUBLISH_DATA} packets based on the maximum packet size set out in the \mi{c}{CONNACK} packet for the connection. When subscribers receive the published packets from a broker they will re-assemble the segments into the original payload.
+\end{itemize}
 
 \clearpage
 \phantomsection
