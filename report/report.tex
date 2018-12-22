@@ -431,6 +431,36 @@ Like \mi{c}{PUBLISH_START}, it can be sent by either the client (if that client 
 	\item Actual (partial) message payload: The remainder of the packet is data \textbf{of an arbitrary format}. A publisher will split the full payload into a number of \mi{c}{PUBLISH_DATA} packets based on the maximum packet size set out in the \mi{c}{CONNACK} packet for the connection. When subscribers receive the published packets from a broker they will re-assemble the segments into the original payload.
 \end{itemize}
 
+\subsection{Code overview}
+The implementation of the protocol described above (as well as a number of sample programs) is divided into a number of Rust crates. An overview of these will be given here.
+
+\subsubsection{\mi{c}{pubsub-common}}
+This crate contains code shared by the client and broker crates. Mainly this consists of packet encoding / decoding, the actual Go-Back-N implementation (both in \mi{c}{protocol.rs}), a timer management struct (\mi{c}{timer.rs}) and some other constants and utility functions.
+
+\medskip
+\noindent \textbf{Timer manager}
+
+\smallskip
+\noindent \mi{c}{timer.rs} contains a struct (\mi{rust}{TimerManager}) which dispatches messages (through user provided callbacks) at a specified time. This is implemented primarily through the use of a priority queue (provided by the \mi{rust}{priority-queue} crate) and a single background thread. Timers can be cancelled or re-scheduled.
+
+When a timer is created, it is inserted into the priority queue (the soonest timer is at the front of the queue). The background thread will sleep until the timer at the front of the queue should be triggered, then it will invoke that timer's callback with the stored message before returning to sleep until the next timer's message should be dispatched.
+
+Note that because a new timer could be created which should be triggered before the one currently at the front of the queue, the background thread will always be woken up after the timer has been inserted into the priority queue.
+
+\mi{rust}{TimerManager} is used primarily to implement the timeout and re-sending of the Go-Back-N window, but is also used to inform of timeouts under \mi{c}{keepalive} mode (and to schedule regular transmission of \mi{c}{HEARTBEAT} packets by clients).
+
+\medskip
+\noindent \textbf{Protocol encoding / decoding}
+
+\smallskip
+\noindent The \mi{rust}{protocol} module contains a number of structs, the primary one being \mi{rust}{Jqtt}. Used by both the client and broker, it handles decoding incoming bytes into a \mi{c}{Packet} enum variant (in the \mi{rust}{decode()} function as well as encoding and dispatching packets via the \mi{rust}{send_*()} functions.
+
+\mi{rust}{gbn_send()} will either write a packet to the wire and place it into the send window, or queue it up for later transmission in a separate send buffer. The send window and send buffer are represented as linked lists. Each packet also gets a locally stored packet ID which can be used later to determine if that packet has been successfully delivered (acknowledged).
+
+Upon receipt of an \mi{c}{ACK}, the current \mi{c}{ACK} timeout timer (also managed by the \mi{rust}{Jqtt} struct) is cancelled. The acknowledged packets are then dropped from the send window. If there are packets in the send buffer, the free space in the send with those and they are written to the socket. The \mi{c}{ACK} timeout timer is also restarted.
+
+If an \mi{c}{ACK} timeout occurs, all of the packets in the send window will be re-transmitted.
+
 \clearpage
 \phantomsection
 \addcontentsline{toc}{section}{References}
