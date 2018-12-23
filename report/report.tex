@@ -307,8 +307,8 @@ The implementation of the assignment is called ``JQTT'' (Jack's Queueing Telemet
 			\item \mi{c}{pubsub-client}: JQTT publisher / subscriber library
 			\item \mi{c}{pubsub-common}: Common code used by broker / client
 			\item \mi{c}{pubsub-server}: Command line application which starts a broker using the \mi{c}{pubsub-broker} library
-			\item \mi{c}{pubsub-client}: Interactive client demo with publish / subscribe in an \mi{c}{ncurses}-like UI
 			\item \mi{c}{pubsub-demos}: Additional mini command line demos
+			\item \mi{c}{pubsub-interactive}: Interactive client demo with publish / subscribe in an \mi{c}{ncurses}-like UI
 		\end{itemize}
 	\item Go-Back-N was used as the flow control method of choice (with a window size of 15)
 	\item Messages can (in theory) be up to 4GB (32-bit) in size thanks to multi-packet messages
@@ -317,7 +317,7 @@ The implementation of the assignment is called ``JQTT'' (Jack's Queueing Telemet
 \end{itemize}
 
 \subsection{Protocol} \label{sec:protocol}
-The JQTT protocol is made up of 9 different packet types. Each is made up of a 1 byte header and (usually) some kind of payload. All integers are in network / big endian. The header looks like this:
+The JQTT protocol is made up of 9 different packet types. Each is made up of a 1 byte header and (usually) some kind of payload. All integers are represented in network / big endian. The header looks like this:
 
 \newcommand*{\tn}[2]{\tikz[baseline,remember picture]\node[inner sep=0pt,outer sep=2pt,anchor=base] (#1) {#2};}
 \begin{figure}[h!]
@@ -460,6 +460,106 @@ Note that because a new timer could be created which should be triggered before 
 Upon receipt of an \mi{c}{ACK}, the current \mi{c}{ACK} timeout timer (also managed by the \mi{rust}{Jqtt} struct) is cancelled. The acknowledged packets are then dropped from the send window. If there are packets in the send buffer, the free space in the send with those and they are written to the socket. The \mi{c}{ACK} timeout timer is also restarted.
 
 If an \mi{c}{ACK} timeout occurs, all of the packets in the send window will be re-transmitted.
+
+\subsubsection{\mi{c}{pubsub-broker}}
+This crate contains a library which implements the broker side of the JQTT protocol. The only publicly accessible struct is \mi{c}{Broker}, which handles all aspects of the protocol for a crate user.
+
+\medskip
+\noindent\mi{rust}{Broker} will create a UDP socket (and corresponding IO thread) on each provided address. A number of worker threads will also be created to handle clients. Incoming data is truncated to the specified maximum packet sizes (for IPv4 and IPv6 respectively). When a packet is received, it is handed to the worker manager.
+
+\mi{rust}{WorkerManager} will then check if state (\mi{rust}{Client}) already exists for the source address of the packet. If so, it will pass the packet to the \mi{rust}{Clients} struct for handling. Otherwise, a new \mi{rust}{Client} struct will be created and assigned a worker thread (selected in a round-robin fashion each time a new client connects).
+
+\mi{rust}{Clients} (in the \mi{c}{client} module) maintains a hashtable (provided by the \mi{rust}{evmap} crate) of client addresses mapped to a \mi{rust}{Client} struct and a pointer to its assigned worker's packet queue (provided by the \mi{rust}{crossbeam} queue). When the worker manager calls \mi{rust}{dispatch()}, \mi{rust}{Clients} will post the packet to the appropriate worker queue.
+
+\mi{rust}{Worker}'s thread runs in a loop waiting for messages in its queue (usually packets from assigned clients). When a packet arrives from \mi{rust}{Clients}, the worker will call the \mi{rust}{Client}'s \mi{rust}{handle()} function. This will handle simple packets (such as \mi{c}{CONNECT} - a \mi{c}{CONNACK} response will be sent appropriately). When message-related packets arrive, \mi{rust}{Client} will use \mi{rust}{MessageMapping} to translate the client-only message ID to a globablly-valid (for the broker) one. \mi{rust}{MessageInfo} is used to track whether the message has been fully received (so the information can be dropped and the message ID can be re-used).
+
+For \mi{c}{(UN)SUBSCRIBE} packets, \mi{rust}{Client} will return an \mi{rust}{Action} enum variant and the worker will access the \mi{rust}{Subscriptions} struct (wrapping another hashtable mapping topics to a set of client addresses) to perform the appropriate action.
+
+After translating the message ID's for \mi{rust}{PublishStart} / \mi{rust}{PublishData} packets, an \mi{rust}{Action} enum variant is returned by \mi{rust}{Client::handle()}. The worker will then dispatch the translated packet to all subscribers (obtained from the \mi{rust}{Subscriptions} struct).
+
+The worker will also handle \mi{c}{ACK} timeouts (calling \mi{rust}{Jqtt::handle_ack_timeout()}) and \mi{c}{HEARTBEAT} timeouts (sending \mi{c}{DISCONNECT} if \mi{c}{keepalive} mode is enabled).
+
+\subsubsection{\mi{c}{pubsub-client}}
+The \mi{c}{pubsub-client} crate provides a client library to establish a connection to a broker and publish / receive messages.
+
+\medskip
+\noindent Users can call \mi{rust}{Client::connect()} (or alternatively \mi{rust}{Client::connect_timers()} to re-use an existing \mi{rust}{TimerManager}) to establish a connection to a broker listening on the provided address. I/O and work threads will be created once the broker has responded with a \mi{c}{CONNACK}.
+
+\mi{rust}{ClientInner} is analogous to \mi{c}{pubsub-broker} \mi{rust}{Client}. The worker thread, upon receiving a packet from the I/O thread, will call \mi{rust}{Client::handle()}. If a \mi{c}{PublishStart} or \mi{c}{PublishData} packet is received, the user-provided listener will be called.
+
+The worker thread will handle timeouts as the worker's does. Any errors will be passed to the user's listener.
+
+When the user wishes to subscribe to / unsubscribe from a topic, they can call \mi{rust}{Client::subscribe()} and \mi{rust}{Client::unsubscribe()} respectively. These will block until the broker acknowledges the \mi{c}{SUBSCRIBE} / \mi{c}{UNSUBSCRIBE} packets. This achieved using \mi{rust}{std::sync::Condvar}'s in conjunction with the \mi{c}{pubsub-common} \mi{rust}{Jqtt} to wait until there is space available in the send buffer and then that the packet ID has been acknowledged.
+
+\medskip
+\noindent If the user wishes to send a message, they can pass a \mi{rust}{Message} struct (from the \mi{c}{messaging} module) to \mi{rust}{Client::queue_message()}. \mi{rust}{Message} requires that the user provide the total size of the message, the topic the message should be published to and an implementation of \mi{rust}{std::io::Read} (e.g. \mi{rust}{std::fs::File}, or \mi{rust}{std::io::Cursor} wrapping a buffer, or even another network resource). A client message ID will be chosen and a \mi{rust}{MessageInfo} struct will be created (generating the \mi{c}{PUBLISH_START} packet). This will then be placed in the message queue. \textbf{No data will be sent at this time}, allowing for a number of messages to be queued up before being transmitted in parallel.
+
+In order to actually send the queued messages, \mi{rust}{Client::drain_messages()} should be called. In a loop which terminates when the message queue is empty, the following steps take place:
+\begin{enumerate}
+	\item Wait until there is space in the send buffer for at least 32 packets
+	\item While there is still space in the send buffer:
+		\begin{enumerate}
+			\item Select the next message in the queue
+			\item Generate the next packet for the currently selected message (by reading some bytes from its stream to fill the payload for \mi{rust}{PUBLISH_DATA}) and call \mi{rust}{Jqtt::gbn_send()} to send it
+			\item If the message has been fully sent, remove it from the queue
+		\end{enumerate}
+	\item Wait for the last transmitted packet to be acknowledged (i.e. all sent packets have been acknowledged under Go-Back-N)
+\end{enumerate}
+
+\medskip
+\noindent Although the user-provided listener allows incoming messages to be streamed (useful if a very large message is being received and it would be undesirable to keep the whole thing in memory), often it is more desirable to be able get a callback when a message has been completely received.
+
+\mi{rust}{MessageCollector} performs this task, handling parallel messages and combining received \mi{c}{PUBLISH_DATA} packets into a \mi{rust}{Message} and passing it to the user-provided callback.
+
+\subsubsection{\mi{c}{pubsub-server}}
+While \mi{c}{pubsub-broker} only provides a library and no executable, \mi{c}{pubsub-server} provides a simple binary which allows you to set the following options through command line switches:
+\begin{itemize}
+	\item Log level (defaults to \mi{c}{INFO}, each instance of \mi{c}{-v} passed increases verbosity by one level)
+	\item Bind address(es)
+	\item Worker thread count (defaults to $n_{cpus} - 1$)
+	\item Maximum packet size (defaults to a minimum safe value for UDP under IPv4 and IPv6 \cite{udp-safe})
+\end{itemize}
+
+\subsubsection{\mi{c}{pubsub-demos}}
+This crate provides a few simple demos - note that a broker must be running already for these to work (e.g. via \mi{c}{pubsub-server}):
+\begin{itemize}
+	\item \mi{c}{big-publish}: This demo will create a single client send:
+		\begin{itemize}
+			\item Send one 512MB message (of zeroes) and report send statistics
+			\item Send two 512MB messages (in parallel) and report send statistics
+		\end{itemize}
+		With no subscribers to the ``/dev/zero'' topic, release build performance is approximately 119.22MB/s for a single message and 58.51MB/s for two (IPv6 across the loopback interface with the default packet size on a 16-core AMD Threadripper 1950x @ 4.0GHz).
+
+	\item \mi{c}{big-receive}: Receives a single message from the ``/dev/zero'' topic, reports receive statistics and exits. Receiving the first message on the same system as above runs at approximately 94.79MB/s.
+	\item \mi{c}{scale}: A demo to test the scaling possibilites of the codebase. It does the following:
+		\begin{enumerate}
+			\item Sets up 100 subscribers for each of 4 sample topics (a total of 400 subscribers)
+			\item Starts 10 publishers for each topic (total of 40, each publishing 100 1KB messages with an interval of 200 to 300ms)
+			\item Waits for all publishers to complete publishing and all subscribers to receive all messages (a total of 400000 messages across all 400 subscribers)
+		\end{enumerate}
+	Note that due to limitations in the way that the broker's worker threads handle dispatching messages, it may be necessary to disable keepalive mode for this to complete successfully
+\end{itemize}
+
+\subsubsection{\mi{c}{pubsub-interactive}}
+While \mi{c}{pubsub-demos} provides a set of one-shot programs for testing the protocol, \mi{c}{pubsub-interactive} is more of a user front-end for the client library, featuring a terminal user interface using the \mi{rust}{cursive} crate (similar to \mi{c}{ncurses}).
+
+Its interface looks like a chat program, with a message log at the top and an entry box at the bottom. A number of commands are provided:
+\begin{itemize}
+	\item \mi{c}{help}: Lists available commands
+	\item \mi{c}{subscribe}: Subscribe to a topic
+	\item \mi{c}{unsubscribe}: Unsubscribe from a topic
+	\item \mi{c}{publish}: Publish a message to a topic
+\end{itemize}
+
+Received messages will be printed in the log (if their payloads are valid UTF-8). Pressing \mi{c}{^C} (Ctrl-C) or sending \mi{c}{SIGINT} / \mi{c}{SIGTERM} will exit the program cleanly.
+
+\section{Reflection / limitations}
+Overall, a reasonably solid protocol and codebase was developed. There are some limitations in both the protocol and implementation however:
+\begin{itemize}
+	\item Selective-Repeat-ARQ might be a better flow / error control setup
+	\item There is no provision for clients who acknowledge messages slower than they are sent. One side effect of this is that it limits the possibility of delegating the dispatch of messages onto a separate thread (so that other packets from the publisher could be processed, e.g. avoiding the \mi{c}{keepalive} server timeout problem that occurs when there are a lot of subscribers to a single topic). New packets would likely be required to ask publishers to slow their rate of transmission when a broker's send buffer for a slow client fills up, as well as logic to drop troublesome subscribers who are slowing everybody else down.
+	\item Combining multiple packet into a single UDP payload would be more efficient than sending them separately (e.g. \mi{c}{SUBSCRIBE}, \mi{c}{PUBLISH_START} and \mi{c}{PUBLISH_DATA} packets could be combined into a single packet if they fit). This would require very significant changes to both the protocol and consequentially the implementation.
+\end{itemize}
 
 \clearpage
 \phantomsection
