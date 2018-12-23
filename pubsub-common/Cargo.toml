@@ -10,3 +10,7 @@ quick-error = "~1.2"
 log = "~0.4"
 bytes = "~0.4"
 priority-queue = "~0.5"
+rand = { version = "~0.6", optional = true }
+
+[features]
+unreliable = ["rand"]

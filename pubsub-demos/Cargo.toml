@@ -9,3 +9,6 @@ log = "~0.4"
 simplelog = "~0.5"
 rand = "~0.6"
 pubsub-client = { path = "../pubsub-client" }
+
+[features]
+unreliable = ["pubsub-client/unreliable"]

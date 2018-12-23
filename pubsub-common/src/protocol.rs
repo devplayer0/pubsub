@@ -277,7 +277,7 @@ impl Jqtt {
             let mut iter = self.send_window.iter();
             for _ in 0..self.send_window.len() {
                 let data = iter.next().unwrap();
-                self.socket.send_to(data, self.addr)?;
+                util::send_to(&self.socket, data, self.addr)?;
             }
         }
 
@@ -308,7 +308,7 @@ impl Jqtt {
             let new_send_buf = self.send_buffer.split_off(cmp::min(slide, buf_size));
 
             for data in &self.send_buffer {
-                self.socket.send_to(data, self.addr)?;
+                util::send_to(&self.socket, data, self.addr)?;
             }
             self.send_window.append(&mut self.send_buffer);
             assert!(self.send_window.len() <= WINDOW_SIZE as usize);
@@ -340,7 +340,7 @@ impl Jqtt {
         }
         if !self.window_full() {
             self.send_window.push_back(data);
-            self.socket.send_to(self.send_window.back().unwrap(), self.addr)?;
+            util::send_to(&self.socket, self.send_window.back().unwrap(), self.addr)?;
         } else {
             self.send_buffer.push_back(data);
         }
@@ -369,7 +369,7 @@ impl Jqtt {
             return Err(Error::OutOfOrder(self.recv_seq, seq));
         }
 
-        self.socket.send_to(&[Packet::encode_header(PacketType::Ack, seq)], self.addr)?;
+        util::send_to(&self.socket, &[Packet::encode_header(PacketType::Ack, seq)], self.addr)?;
         self.recv_seq = next_seq(seq);
         Ok(())
     }
@@ -446,7 +446,7 @@ impl Jqtt {
         data.put_u8(Packet::encode_header(PacketType::Connect, 0));
         data.put_slice(CONNECT_MAGIC);
 
-        self.socket.send_to(&data, self.addr)?;
+        util::send_to(&self.socket, &data, self.addr)?;
         Ok(())
     }
     pub fn send_connack(&self, keepalive: bool, max_packet_size: u16) -> Result<(), Error> {
@@ -458,7 +458,7 @@ impl Jqtt {
         bytes.put(header);
         bytes.put_u16_be(max_packet_size);
 
-        self.socket.send_to(&bytes, self.addr)?;
+        util::send_to(&self.socket, &bytes, self.addr)?;
         Ok(())
     }
     pub fn send_heartbeat(&self) -> Result<(), Error> {

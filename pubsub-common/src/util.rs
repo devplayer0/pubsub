@@ -3,7 +3,8 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
-use std::net::{IpAddr, AddrParseError, ToSocketAddrs, SocketAddr};
+use std::io;
+use std::net::{IpAddr, AddrParseError, ToSocketAddrs, SocketAddr, UdpSocket};
 
 use log::LevelFilter;
 use bytes::BytesMut;
@@ -73,4 +74,17 @@ impl BufferProvider {
 
         buffer.split_to(size)
     }
+}
+
+#[inline]
+pub fn send_to<A: ToSocketAddrs>(socket: &UdpSocket, buf: &[u8], addr: A) -> io::Result<usize> {
+    #[cfg(feature = "unreliable")]
+    {
+        if rand::random::<f32>() < 0.3 {
+            // "drop" the packet
+            return Ok(buf.len());
+        }
+    }
+
+    socket.send_to(buf, addr)
 }

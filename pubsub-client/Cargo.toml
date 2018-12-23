@@ -10,3 +10,6 @@ log = "~0.4"
 bytes = "~0.4"
 crossbeam = "~0.5"
 pubsub-common = { path = "../pubsub-common" }
+
+[features]
+unreliable = ["pubsub-common/unreliable"]

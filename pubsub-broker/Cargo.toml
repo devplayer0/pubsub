@@ -12,3 +12,6 @@ crossbeam = "~0.5"
 bytes = "~0.4"
 num_cpus = "~1.8"
 pubsub-common = { path = "../pubsub-common" }
+
+[features]
+unreliable = ["pubsub-common/unreliable"]

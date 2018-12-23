@@ -13,6 +13,8 @@ extern crate quick_error;
 extern crate log;
 extern crate bytes;
 extern crate priority_queue;
+#[cfg(feature = "unreliable")]
+extern crate rand;
 
 pub mod util;
 pub mod timer;

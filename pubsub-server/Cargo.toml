@@ -9,3 +9,6 @@ simplelog = "~0.5"
 clap = "~2.32"
 ctrlc = { version = "~3.0", features = [ "termination" ] }
 pubsub-broker = { path = "../pubsub-broker" }
+
+[features]
+unreliable = ["pubsub-broker/unreliable"]
